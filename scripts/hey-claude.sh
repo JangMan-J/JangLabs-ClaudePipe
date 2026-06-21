@@ -29,9 +29,14 @@ CP_SESSION="${CP_SESSION:-voxtype}"
 CP_TIMEOUT="${CP_TIMEOUT:-30000}"
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-/run/user/$(id -u)/.ydotool_socket}"
 
-# Debug trace (always on for now; logs each real run's decisions to a file).
+# Debug trace (opt-in: set HC_DEBUG=1). Logs each run's pane/read/response/op to
+# $XDG_RUNTIME_DIR/hey-claude.log. Off by default — it would record field contents.
 HC_LOG="${XDG_RUNTIME_DIR:-/tmp}/hey-claude.log"
-dbg() { printf '%s %s\n' "$(date '+%H:%M:%S' 2>/dev/null || echo '?')" "$*" >> "$HC_LOG" 2>/dev/null || true; }
+if [ -n "${HC_DEBUG:-}" ]; then
+    dbg() { printf '%s %s\n' "$(date '+%H:%M:%S' 2>/dev/null || echo '?')" "$*" >> "$HC_LOG" 2>/dev/null || true; }
+else
+    dbg() { :; }
+fi
 dbg "=== run: ZELLIJ=${ZELLIJ:-unset} args=[$*] ==="
 
 if [ -n "${CP_BIN:-}" ]; then :
