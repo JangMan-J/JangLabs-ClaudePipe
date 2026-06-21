@@ -29,6 +29,11 @@ CP_SESSION="${CP_SESSION:-voxtype}"
 CP_TIMEOUT="${CP_TIMEOUT:-30000}"
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-/run/user/$(id -u)/.ydotool_socket}"
 
+# Debug trace (always on for now; logs each real run's decisions to a file).
+HC_LOG="${XDG_RUNTIME_DIR:-/tmp}/hey-claude.log"
+dbg() { printf '%s %s\n' "$(date '+%H:%M:%S' 2>/dev/null || echo '?')" "$*" >> "$HC_LOG" 2>/dev/null || true; }
+dbg "=== run: ZELLIJ=${ZELLIJ:-unset} args=[$*] ==="
+
 if [ -n "${CP_BIN:-}" ]; then :
 elif [ -x "$HERE/../target/release/claude-pipe" ]; then CP_BIN="$HERE/../target/release/claude-pipe"
 elif command -v claude-pipe >/dev/null 2>&1; then CP_BIN="claude-pipe"
@@ -57,9 +62,26 @@ instruction="$(printf '%s' "$instruction" | sed -e 's/^[[:space:]]*//' -e 's/[[:
 # go-to-start / interrupt, NOT select-all / copy (that was corrupting the field
 # and could interrupt Claude). Only for non-zellij GUI fields do we fall back to
 # the clipboard route.
+# Resolve the focused zellij pane. We do NOT gate on $ZELLIJ: when invoked from
+# voxtype's gate (a daemon/systemd context) $ZELLIJ is unset even though zellij is
+# running. Instead, ask zellij directly; if it answers with a focused terminal
+# pane, use the zellij path. `--session` pins the session when not attached.
 pane_id=""
-if [ -n "${ZELLIJ:-}" ] && command -v zellij >/dev/null 2>&1; then
-    pane_id="$(zellij action list-panes --all --json 2>/dev/null | python3 -c '
+if command -v zellij >/dev/null 2>&1; then
+    # Pick the LIVE session: $ZELLIJ_SESSION_NAME if set, else the first session
+    # that is not marked EXITED (list-sessions tags dead ones "EXITED"). Strip
+    # ANSI color codes from the listing before matching.
+    zsession="${ZELLIJ_SESSION_NAME:-}"
+    if [ -z "$zsession" ]; then
+        zsession="$(zellij list-sessions 2>/dev/null \
+            | sed 's/\x1b\[[0-9;]*m//g' \
+            | grep -v 'EXITED' \
+            | awk 'NF{print $1; exit}')"
+    fi
+    zargs=""
+    [ -n "$zsession" ] && zargs="--session $zsession"
+    # shellcheck disable=SC2086
+    pane_id="$(zellij $zargs action list-panes --all --json 2>/dev/null | python3 -c '
 import sys, json
 try: panes = json.load(sys.stdin)
 except Exception: sys.exit(0)
@@ -74,7 +96,7 @@ if [ -n "$pane_id" ]; then
     # is the "❯ ..." line that sits between two horizontal-rule lines near the
     # bottom; for a shell it is the last "❯ "/"$ " prompt line. We take the LAST
     # line that begins (after the prompt marker) the input, strip the marker.
-    current="$(zellij action dump-screen --pane-id "$pane_id" 2>/dev/null | python3 -c '
+    current="$(zellij $zargs action dump-screen --pane-id "$pane_id" 2>/dev/null | python3 -c '
 import sys
 lines = [l.rstrip("\n") for l in sys.stdin]
 # find the last line whose first non-space char is a prompt marker
@@ -93,9 +115,12 @@ else
     current="$(wl-paste --no-newline 2>/dev/null || true)"
 fi
 
+dbg "pane_id=[$pane_id] read current=[$current]"
+
 # --- ask the agent ------------------------------------------------------------
 resp="$(printf 'CURRENT_PROMPT:\n%s\n\nINSTRUCTION:\n%s' "$current" "$instruction" \
     | "$CP_BIN" send --session "$CP_SESSION" --timeout-ms "$CP_TIMEOUT" --json 2>/dev/null || true)"
+dbg "agent resp=[$resp]"
 if [ -z "$resp" ]; then
     notify "Hey Claude: agent unavailable" "Is the pipe up? (systemctl --user start claude-pipe-voxtype)"
     echo "hey-claude: no response from claude-pipe ($CP_SESSION)" >&2; exit 3
@@ -126,6 +151,7 @@ else: none("bad-op")
 ')"
 op="$(printf '%s' "$plan" | python3 -c 'import sys,json;print(json.load(sys.stdin)["op"])')"
 get_text() { printf '%s' "$plan" | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin).get("text",""))'; }
+dbg "plan=[$plan] op=[$op]"
 
 # --- apply --------------------------------------------------------------------
 # In a zellij pane, address the pane DIRECTLY with `zellij action write` — no focus
@@ -133,9 +159,9 @@ get_text() { printf '%s' "$plan" | python3 -c 'import sys,json;sys.stdout.write(
 # went to the wrong target / didn't land). Only GUI fields fall back to ydotool.
 # zellij byte codes: Ctrl-U=21, Enter=13, End=control-seq (we use write-chars+nav).
 if [ -n "$pane_id" ]; then
-    zkill() { zellij action write --pane-id "$pane_id" 21 >/dev/null 2>&1; }   # Ctrl-U
-    zenter() { zellij action write --pane-id "$pane_id" 13 >/dev/null 2>&1; }  # Enter
-    ztype() { zellij action write-chars --pane-id "$pane_id" "$1" >/dev/null 2>&1; }
+    zkill() { zellij $zargs action write --pane-id "$pane_id" 21 >/dev/null 2>&1; }   # Ctrl-U
+    zenter() { zellij $zargs action write --pane-id "$pane_id" 13 >/dev/null 2>&1; }  # Enter
+    ztype() { zellij $zargs action write-chars --pane-id "$pane_id" "$1" >/dev/null 2>&1; }
     case "$op" in
         none)    : ;;
         submit)  zenter ;;
