@@ -111,30 +111,35 @@ directly from any language by connecting to the socket.
 
 ## Scripts (`scripts/`)
 
-A reference consumer: the **"Hey Claude"** voxtype Siri-style command — a spoken
-instruction rewrites the in-progress input line of the focused zellij shell pane.
-Built on `zellij action` only (no clipboard, no ydotool, no focus change).
+A reference consumer: **voice-edit the in-progress prompt**. While dictating, hold
+**Right Ctrl + Right Shift** to mark a recording as a *command*: a lean Claude agent
+interprets the spoken instruction and edits the text you are currently composing in
+the focused input field — edit, append, submit, or clear. Scope is deliberately
+narrow: the agent only ever touches the unfinished prompt, never files, output, or
+other panes. Field I/O is clipboard + ydotool, so it works in any focused field.
 
-- `zellij-field.sh` — read/replace the focused shell pane's input line:
-  `id | kind | read | replace TEXT`. Refuses non-shell (TUI) panes.
-- `hey-claude-up.sh` — keep-warm. Default: idempotent detached launch (no-op if
-  already live). `--foreground`: run supervised (for systemd). Reads the rewrite
-  contract from `rewrite-prompt.txt` (single source of truth).
-  `CP_MODEL=claude-haiku-4-5-20251001` for fast warm turns.
-- `rewrite-prompt.txt` — the rewrite system prompt; shared by the launcher and any
-  service unit so the contract lives in exactly one place.
-- `hey-claude.sh` — the handler: capture the line → `send --json` → parse the reply
-  → apply. Reply contract is **JSON ops, fail-closed** (an unparseable reply types
-  nothing):
-  - `{"op":"replace","text":"…","submit":false}` — fill the line (and optionally run it)
-  - `{"op":"keys","keys":["ctrl+a"]}` — a pure cursor/edit action
-  - `{"op":"none"}` — refuse / touch nothing
+- `cmd-key-watcher.py` — read-only evdev watcher: Right Shift DOWN latches a
+  one-shot `voxtype-cmd-mode` flag (does not grab the key — normal Shift still
+  works). Bridges "Shift held at record time" to "flag read at transcribe time".
+- `hey-claude.sh` — the handler: read the field (Ctrl+A/Ctrl+C → `wl-paste`) →
+  `send --json` (CURRENT_PROMPT + INSTRUCTION) → parse → apply via ydotool. Reply
+  contract is **JSON ops, fail-closed** (an unparseable reply does nothing):
+  - `{"op":"replace","text":"…"}` — replace the whole field
+  - `{"op":"append","text":"…"}` — add to the end
+  - `{"op":"submit"}` / `{"op":"clear"}` / `{"op":"none"}`
+- `rewrite-prompt.txt` — the agent contract (field-edit only); single source of
+  truth, shared by the launcher and the systemd unit.
+- `hey-claude-up.sh` — keep-warm. Default: idempotent detached launch. `--foreground`
+  for systemd supervision. `CP_MODEL=claude-haiku-4-5-20251001` for fast warm turns.
+- `zellij-field.sh` — (legacy) zellij-native pane input read/replace; superseded by
+  the clipboard path in `hey-claude.sh` but kept for the zellij-only route.
 
-Wake-phrase detection lives in voxtype's `llm-gate.sh` (a `~/.config` dotfile, not
-this repo): a transcript starting with "Hey Claude" (homophone-tolerant) is
-stripped and routed to `hey-claude.sh`, suppressing the normal paste. Keep-warm is
-a systemd user service (`~/.config/systemd/user/claude-pipe-voxtype.service`)
-running `hey-claude-up.sh --foreground`, so the agent survives reboot/crash.
+Command-mode routing lives in voxtype's `llm-gate.sh` (a `~/.config` dotfile, not
+this repo): if the `voxtype-cmd-mode` flag is fresh (or the transcript opens with
+"hey claude" as a no-key fallback), the transcript is routed to `hey-claude.sh` and
+nothing is pasted. Keep-warm is a systemd user service
+(`~/.config/systemd/user/claude-pipe-voxtype.service`); the watcher should likewise
+run as a user service so the flag is always latched.
 
 ## Status
 
