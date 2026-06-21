@@ -34,6 +34,7 @@ FLAG = os.path.join(RUNTIME, "voxtype-cmd-mode")
 # keyboard, not the input-remapper virtuals). Substring match on device name.
 DEVICE_NAME_SUBSTR = os.environ.get("CMD_WATCH_DEVICE", "N-KEY Device")
 KEYCODE = ecodes.KEY_RIGHTSHIFT
+DEBUG = os.environ.get("CMD_WATCH_DEBUG", "") != ""
 
 
 def find_devices():
@@ -55,8 +56,11 @@ def set_flag():
     try:
         with open(FLAG, "w") as f:
             f.write(str(time.time()))
-    except OSError:
-        pass
+        if DEBUG:
+            sys.stderr.write(f"cmd-key-watcher: wrote flag {FLAG}\n"); sys.stderr.flush()
+    except OSError as e:
+        if DEBUG:
+            sys.stderr.write(f"cmd-key-watcher: FLAG WRITE FAILED {FLAG}: {e}\n"); sys.stderr.flush()
 
 
 def touch_flag():
@@ -85,6 +89,9 @@ def main():
             try:
                 for ev in d.read():
                     if ev.type == ecodes.EV_KEY and ev.code == KEYCODE:
+                        if DEBUG:
+                            sys.stderr.write(f"cmd-key-watcher: RIGHTSHIFT {ev.value}\n")
+                            sys.stderr.flush()
                         if ev.value == 1:      # DOWN
                             set_flag()
                         elif ev.value == 2:    # autorepeat while held
