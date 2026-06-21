@@ -1,0 +1,108 @@
+# claude-pipe
+
+A lean, standalone **request/reply pipe to a persistent Claude Code agent**.
+
+Spawning `claude -p` per call pays a ~2.4 s cold start every time. `claude-pipe`
+spawns **one long-lived `claude` process** in streaming-JSON mode and relays
+messages to it over a Unix-domain socket. You pay the cold start **once**, at
+`up`; every `send` afterwards costs only Claude's inference latency.
+
+Measured on this machine (Haiku, warm): **~1.1 s/turn**, vs ~2.5 s for
+`claude -p` cold-start — a 2.3× speedup, with full **context retained** across
+turns (it's one continuous conversation).
+
+No terminal multiplexer in the hot path: we own the process, so we talk to its
+stdin/stdout directly. This is deliberately a thin, reusable **platform** — the
+only thing a consumer needs is `claude-pipe send "<text>"`.
+
+## Build
+
+```sh
+cargo build --release
+# binary at target/release/claude-pipe
+```
+
+## Use
+
+```sh
+# Start a persistent agent (one process + one socket per session name).
+claude-pipe up --detach \
+  --model claude-haiku-4-5-20251001 \
+  --system "You are terse. Reply with only the answer."
+
+# Send a message; blocks until the turn completes; prints the reply.
+claude-pipe send "press control u"
+echo "transcribe this" | claude-pipe send          # message from stdin
+claude-pipe send --json "..."                        # full response envelope
+
+# Inspect / stop.
+claude-pipe status
+claude-pipe down
+```
+
+Named sessions run independently, so different projects/purposes don't collide:
+
+```sh
+claude-pipe up --detach --session dictation
+claude-pipe send --session dictation "..."
+```
+
+## The wire contract (all a consumer depends on)
+
+Request (client → daemon), one JSON line over the socket:
+
+```json
+{"text": "press control u", "timeout_ms": 60000}
+```
+
+Response (daemon → client), one JSON line:
+
+```json
+{"ok": true, "text": "<claude reply>", "session_id": "abc123", "turn_ms": 1100}
+```
+
+On error/timeout: `{"ok": false, "text": "", "error": "timeout after …"}`.
+
+`claude-pipe send` is just a thin client over this; you can speak the protocol
+directly from any language by connecting to the socket.
+
+## How it works
+
+```
+  client (any consumer)                     claude-pipe daemon
+  ┌──────────────────────┐                 ┌──────────────────────────────────┐
+  │ claude-pipe send "…" │ ── UDS req ───► │ serializing worker                │
+  │   (blocks for reply) │                 │  owns: claude -p --verbose         │
+  │                      │ ◄── UDS reply ─ │    --input-format stream-json      │
+  └──────────────────────┘                 │    --output-format stream-json     │
+                                            │    [--model] [--resume <sid>]      │
+                                            │  write {"type":"user",…} → stdin   │
+                                            │  read events until {"type":        │
+                                            │    "result", …}  (turn sentinel)   │
+                                            └──────────────────────────────────┘
+```
+
+- **Serialization.** Claude's streaming stdin/stdout is a single ordered
+  channel, so the daemon runs **one turn at a time** (a worker behind an mpsc
+  queue). Correct for sequential workloads like dictation; replies can't
+  interleave.
+- **Turn completion** is detected by Claude's own `result` event — no
+  transcript-tailing, no prompt-ready heuristics, no screen scraping.
+- **Persistence.** The `session_id` is saved to a state file; restart with
+  `--resume <session_id>` to continue the same conversation.
+- **Timeout recovery.** If a turn exceeds `timeout_ms`, its `result` is still
+  pending on the stream; the daemon **drains** that stale output before serving
+  the next request, so the stream never desyncs (replies stay aligned).
+
+## Runtime files
+
+`$XDG_RUNTIME_DIR/claude-pipe/` (fallback `/tmp/claude-pipe-$UID/`):
+
+- `<session>.sock` — the request/reply socket
+- `<session>.state.json` — pid, current `session_id`, model
+
+## Status
+
+First slice: core pipe (`up` / `send` / `down` / `status`), one model session,
+text in / text out. Not yet: multi-message batching, an "attach to watch" pane,
+structured-output (`--json`-schema) replies. The wire contract is stable.
