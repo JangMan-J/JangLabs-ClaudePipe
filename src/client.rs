@@ -93,6 +93,12 @@ pub async fn run_status(session: String) -> Result<()> {
             println!("(no state file)");
         }
     }
+    // Exit code reflects liveness so `status` is usable as a shell predicate
+    // (e.g. `if claude-pipe status …; then …`). Liveness = the socket accepts a
+    // connection, not merely the presence of a state file.
+    if !live {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
