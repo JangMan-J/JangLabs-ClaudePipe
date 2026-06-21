@@ -2,9 +2,14 @@
 # hey-claude-up.sh — bring up (keep warm) the persistent claude-pipe agent used by
 # the "Hey Claude" voxtype consumer, with the rewrite system prompt baked in.
 #
-# Idempotent: if the session is already up, this is a fast no-op. Intended to be
-# called from voxtype's "Recording started" hook so the agent is hot by the time
-# you finish speaking.
+# Default: idempotent detached launch — if the session is already up this is a
+# fast no-op. Intended for a PTT "record start" hook so the agent is hot by the
+# time you finish speaking.
+#
+# --foreground: run claude-pipe up in the FOREGROUND (no --detach) so a service
+# manager (systemd) can supervise and restart it. Skips the idempotency check.
+#
+# Single source of truth for the rewrite contract: scripts/rewrite-prompt.txt.
 #
 # Env: CP_SESSION (default voxtype), CP_BIN, CP_MODEL (default: claude's default;
 #      set CP_MODEL=claude-haiku-4-5-20251001 for the fastest warm turns).
@@ -14,53 +19,37 @@ set -eu
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 CP_SESSION="${CP_SESSION:-voxtype}"
 CP_MODEL="${CP_MODEL:-}"
+PROMPT_FILE="${HC_PROMPT_FILE:-$HERE/rewrite-prompt.txt}"
+
+foreground=0
+[ "${1:-}" = "--foreground" ] && foreground=1
 
 if [ -n "${CP_BIN:-}" ]; then :
 elif [ -x "$HERE/../target/release/claude-pipe" ]; then CP_BIN="$HERE/../target/release/claude-pipe"
 elif command -v claude-pipe >/dev/null 2>&1; then CP_BIN="claude-pipe"
 else echo "hey-claude-up: claude-pipe not found" >&2; exit 3; fi
 
-# already up? Check the printed liveness, not just the exit code: older
-# claude-pipe builds exit 0 from `status` even when dead. We treat the session as
-# up only if status reports `live: true`.
-if "$CP_BIN" status --session "$CP_SESSION" 2>/dev/null | grep -q '^live:[[:space:]]*true'; then
-    exit 0
+[ -r "$PROMPT_FILE" ] || { echo "hey-claude-up: prompt file not readable: $PROMPT_FILE" >&2; exit 3; }
+SYS="$(cat "$PROMPT_FILE")"
+
+# detached mode: skip if already live. Check the PRINTED liveness, not just exit
+# code (older claude-pipe builds exit 0 from `status` even when dead).
+if [ "$foreground" -eq 0 ]; then
+    if "$CP_BIN" status --session "$CP_SESSION" 2>/dev/null | grep -q '^live:[[:space:]]*true'; then
+        exit 0
+    fi
 fi
 
-# The rewrite contract. Kept terse and absolute — the model must emit ONE JSON
-# object and nothing else. Examples teach the four ops. "none" is the safe valve.
-SYS='You convert a spoken INSTRUCTION about a shell command line into ONE action.
-You are given INSTRUCTION (what the user said) and CURRENT_INPUT_LINE (what is
-currently typed at their shell prompt; may be empty).
+set -- up --session "$CP_SESSION" --system "$SYS"
+[ -n "$CP_MODEL" ] && set -- "$@" --model "$CP_MODEL"
+[ "$foreground" -eq 0 ] && set -- "$@" --detach
 
-Reply with EXACTLY ONE JSON object and NOTHING else. No prose. No markdown fence.
-No explanation. The JSON is consumed by a program and typed into a real shell.
-
-Ops:
-  {"op":"replace","text":"<the new command line>"}            replace the line
-  {"op":"replace","text":"<the new command line>","submit":true}  replace then run it
-  {"op":"keys","keys":["ctrl+a"]}    a pure cursor/edit action, no text change
-  {"op":"none"}                       when the instruction is a question, is unclear,
-                                      or should not change the shell at all
-
-Rules:
-- "text" is the FULL replacement line, not a diff. Preserve the parts the user did
-  not ask to change. Output the command exactly as it should appear — no $ or ❯.
-- Only set "submit":true when the user clearly asks to run/execute it.
-- Allowed keys: enter, ctrl+a, ctrl+e, ctrl+u, ctrl+k, ctrl+w, ctrl+c, home, end,
-  tab, escape, backspace.
-- If you are unsure, or the instruction is not an edit to the command line, use
-  {"op":"none"}. Never guess a destructive command.'
-
-# NOTE: do NOT `exec` here. `up --detach` already daemonizes via setsid(2) and
-# returns once the socket is ready. If we exec, this script process BECOMES the
-# detached launcher and, on its exit, the process group receives SIGHUP which
-# kills the freshly-setsid'd grandchild daemon before it serves a turn (verified:
-# exec => daemon dies immediately; plain call => daemon survives). Run it as a
-# normal child and let this script return on its own.
-# shellcheck disable=SC2086
-if [ -n "$CP_MODEL" ]; then
-    "$CP_BIN" up --session "$CP_SESSION" --detach --model "$CP_MODEL" --system "$SYS"
+# foreground: exec so systemd supervises claude-pipe directly (it then owns the
+# daemon; no detached grandchild to lose). detached: run as a normal child and
+# return — do NOT exec (exec + --detach => the freshly setsid'd daemon gets
+# SIGHUP on this script's exit and dies before serving a turn).
+if [ "$foreground" -eq 1 ]; then
+    exec "$CP_BIN" "$@"
 else
-    "$CP_BIN" up --session "$CP_SESSION" --detach --system "$SYS"
+    "$CP_BIN" "$@"
 fi

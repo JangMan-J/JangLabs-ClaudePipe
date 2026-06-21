@@ -117,8 +117,12 @@ Built on `zellij action` only (no clipboard, no ydotool, no focus change).
 
 - `zellij-field.sh` — read/replace the focused shell pane's input line:
   `id | kind | read | replace TEXT`. Refuses non-shell (TUI) panes.
-- `hey-claude-up.sh` — idempotent keep-warm; brings up a `voxtype` session with the
-  rewrite system prompt. `CP_MODEL=claude-haiku-4-5-20251001` for fast warm turns.
+- `hey-claude-up.sh` — keep-warm. Default: idempotent detached launch (no-op if
+  already live). `--foreground`: run supervised (for systemd). Reads the rewrite
+  contract from `rewrite-prompt.txt` (single source of truth).
+  `CP_MODEL=claude-haiku-4-5-20251001` for fast warm turns.
+- `rewrite-prompt.txt` — the rewrite system prompt; shared by the launcher and any
+  service unit so the contract lives in exactly one place.
 - `hey-claude.sh` — the handler: capture the line → `send --json` → parse the reply
   → apply. Reply contract is **JSON ops, fail-closed** (an unparseable reply types
   nothing):
@@ -126,8 +130,11 @@ Built on `zellij action` only (no clipboard, no ydotool, no focus change).
   - `{"op":"keys","keys":["ctrl+a"]}` — a pure cursor/edit action
   - `{"op":"none"}` — refuse / touch nothing
 
-Still to wire: wake-phrase detection in voxtype's `llm-gate.sh` and the keep-warm
-call on "Recording started".
+Wake-phrase detection lives in voxtype's `llm-gate.sh` (a `~/.config` dotfile, not
+this repo): a transcript starting with "Hey Claude" (homophone-tolerant) is
+stripped and routed to `hey-claude.sh`, suppressing the normal paste. Keep-warm is
+a systemd user service (`~/.config/systemd/user/claude-pipe-voxtype.service`)
+running `hey-claude-up.sh --foreground`, so the agent survives reboot/crash.
 
 ## Status
 
