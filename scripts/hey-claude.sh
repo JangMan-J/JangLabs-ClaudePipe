@@ -6,9 +6,15 @@
 # that text, applies a spoken instruction (edit / append / submit / clear), and
 # writes the result back. No files, no other panes, no terminal actions.
 #
-# Field I/O is via the clipboard + ydotool, so it works in ANY focused field
-# (Claude Code box, shell, GUI), at the cost of clobbering the clipboard (the user
-# runs voxtype with restore_clipboard=false, so this is acceptable).
+# Field I/O is HYBRID. In a zellij pane (the real use case — the Claude box or a
+# shell) the prompt is read with `dump-screen` (non-destructive) and written with
+# `zellij action write`/`write-chars` addressed by pane id. The Claude box renders
+# a MULTI-LINE prompt as a block between two "────" rule lines (first line marked
+# with "❯"+NBSP, continuations indented 2 spaces); we read the whole block and
+# clear it with Ctrl-C (clears the draft when text is present). Only non-zellij
+# GUI fields fall back
+# to the clipboard + ydotool route (clobbers the clipboard; voxtype runs with
+# restore_clipboard=false, so that's acceptable).
 #
 # Reply contract (JSON ops, FAIL-CLOSED — see rewrite-prompt.txt):
 #   {"op":"replace","text":"..."}  replace the whole field
@@ -29,9 +35,13 @@ CP_SESSION="${CP_SESSION:-voxtype}"
 CP_TIMEOUT="${CP_TIMEOUT:-30000}"
 export YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-/run/user/$(id -u)/.ydotool_socket}"
 
-# Debug trace (opt-in: set HC_DEBUG=1). Logs each run's pane/read/response/op to
+# Debug trace (opt-in). Logs each run's pane/read/response/op to
 # $XDG_RUNTIME_DIR/hey-claude.log. Off by default — it would record field contents.
+# Enable by EITHER setting HC_DEBUG=1 OR touching $XDG_RUNTIME_DIR/heyclaude-debug
+# (the flag-file works even when invoked from the gate, which doesn't pass env).
 HC_LOG="${XDG_RUNTIME_DIR:-/tmp}/hey-claude.log"
+HC_DEBUG_FLAG="${XDG_RUNTIME_DIR:-/tmp}/heyclaude-debug"
+[ -f "$HC_DEBUG_FLAG" ] && HC_DEBUG=1
 if [ -n "${HC_DEBUG:-}" ]; then
     dbg() { printf '%s %s\n' "$(date '+%H:%M:%S' 2>/dev/null || echo '?')" "$*" >> "$HC_LOG" 2>/dev/null || true; }
 else
@@ -97,22 +107,61 @@ for p in panes:
 fi
 
 if [ -n "$pane_id" ]; then
-    # Extract the ❯ input line from the rendered viewport. For the Claude box it
-    # is the "❯ ..." line that sits between two horizontal-rule lines near the
-    # bottom; for a shell it is the last "❯ "/"$ " prompt line. We take the LAST
-    # line that begins (after the prompt marker) the input, strip the marker.
+    # Extract the in-progress prompt from the rendered viewport. The Claude box
+    # renders it as a MULTI-LINE block bounded by two horizontal-rule lines
+    # ("────") near the bottom: the first content line carries the "❯" marker
+    # (followed by a NON-BREAKING space, U+00A0 — not a normal space!), and each
+    # continuation line is indented two spaces with NO marker. We take the block
+    # between the LAST two rule lines, strip the marker from the first line and
+    # the 2-space indent from the rest, and join with newlines. For a plain shell
+    # (no box) we fall back to the last marked prompt line (single line).
     current="$(zellij $zargs action dump-screen --pane-id "$pane_id" 2>/dev/null | python3 -c '
 import sys
-lines = [l.rstrip("\n") for l in sys.stdin]
-# find the last line whose first non-space char is a prompt marker
-cand = ""
-for l in lines:
-    s = l.lstrip()
-    for m in ("❯ ", "❯", "$ ", "# ", "% "):
+
+NBSP = "\xa0"
+# ❯ may be followed by a non-breaking space (Claude box) or a normal space.
+MARKERS = ("❯" + NBSP, "❯ ", "❯", "$ ", "# ", "% ")
+
+def strip_marker(s):
+    for m in MARKERS:
         if s.startswith(m):
-            cand = s[len(m):]
+            return s[len(m):], True
+    return s, False
+
+def is_rule(l):
+    s = l.strip()
+    if len(s) < 20:
+        return False
+    dash = sum(1 for c in s if c == "─")
+    return dash >= len(s) * 0.6
+
+lines = [l.rstrip("\n") for l in sys.stdin]
+rules = [i for i, l in enumerate(lines) if is_rule(l)]
+
+current = None
+# CASE A: bordered TUI box (Claude) — prompt is between the last two rule lines.
+if len(rules) >= 2:
+    body = lines[rules[-2] + 1:rules[-1]]
+    out, seen = [], False
+    for l in body:
+        text, had = strip_marker(l.lstrip())
+        if had:
+            seen = True
+            out.append(text)
+        else:
+            out.append(l[2:] if l.startswith("  ") else l)
+    while out and out[-1].strip() == "":   # box pads to a min height
+        out.pop()
+    if seen:
+        current = "\n".join(out)
+# CASE B: no box — last non-empty line, marker stripped (shell prompt).
+if current is None:
+    for l in reversed(lines):
+        if l.strip():
+            text, had = strip_marker(l.strip())
+            current = text if had else ""
             break
-sys.stdout.write(cand.strip())
+sys.stdout.write(current or "")
 ' 2>/dev/null)"
 else
     # GUI field: select-all + copy, read the selection.
@@ -164,14 +213,40 @@ dbg "plan=[$plan] op=[$op]"
 # went to the wrong target / didn't land). Only GUI fields fall back to ydotool.
 # zellij byte codes: Ctrl-U=21, Enter=13, End=control-seq (we use write-chars+nav).
 if [ -n "$pane_id" ]; then
-    zkill() { zellij $zargs action write --pane-id "$pane_id" 21 >/dev/null 2>&1; }   # Ctrl-U
+    # Clear the WHOLE input buffer, including a multi-line prompt: in the Claude
+    # box a single Ctrl-C clears the input draft when text is present (it only
+    # interrupts/exits when the box is EMPTY, so it's safe here — we just read a
+    # non-empty prompt). Verified by the user; Esc-Esc did NOT clear in this build,
+    # and a single Ctrl-U only kills the current logical line (left multi-line
+    # prompts partially intact). Ctrl-C = byte 3.
+    zclear() { zellij $zargs action write --pane-id "$pane_id" 3 >/dev/null 2>&1; }
     zenter() { zellij $zargs action write --pane-id "$pane_id" 13 >/dev/null 2>&1; }  # Enter
-    ztype() { zellij $zargs action write-chars --pane-id "$pane_id" "$1" >/dev/null 2>&1; }
+    # Soft-newline inside the prompt (a real Enter would SUBMIT). The Claude box
+    # accepts backslash-continuation: a literal "\" immediately followed by Enter
+    # starts a new prompt line. So a multi-line replacement is typed line-by-line
+    # with "\"+Enter BETWEEN lines (never after the last). Pure bytes — no
+    # terminal-specific Shift+Enter escape to get wrong.
+    zsoftnl() { zellij $zargs action write-chars --pane-id "$pane_id" '\' >/dev/null 2>&1; zenter; }
+    # ztype handles multi-line text: split on \n, type each segment, soft-newline
+    # between them. Single-line text takes the fast path (one write-chars).
+    ztype() {
+        case "$1" in
+            *"
+"*)
+                printf '%s' "$1" | { first=1
+                    while IFS= read -r seg || [ -n "$seg" ]; do
+                        [ "$first" -eq 1 ] || zsoftnl
+                        first=0
+                        zellij $zargs action write-chars --pane-id "$pane_id" "$seg" >/dev/null 2>&1
+                    done; } ;;
+            *) zellij $zargs action write-chars --pane-id "$pane_id" "$1" >/dev/null 2>&1 ;;
+        esac
+    }
     case "$op" in
         none)    : ;;
         submit)  zenter ;;
-        clear)   zkill ;;
-        replace) zkill; ztype "$(get_text)" ;;
+        clear)   zclear ;;
+        replace) zclear; ztype "$(get_text)" ;;
         append)  ztype "$(get_text)" ;;   # write-chars inserts at cursor (line end)
     esac
 else
