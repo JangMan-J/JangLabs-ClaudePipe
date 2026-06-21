@@ -58,14 +58,30 @@ fi
 instruction="$(printf '%s' "$instruction" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 [ -n "$instruction" ] || { echo "hey-claude: empty instruction" >&2; exit 2; }
 
-# --- capture the focused shell pane's input line ------------------------------
+# --- branch on the focused pane kind ------------------------------------------
 kind="$("$FIELD" kind 2>/dev/null || echo unknown)"
+pane_id="$("$FIELD" id 2>/dev/null || true)"
+
+# Claude TUI: do NOT route through the rewrite agent (the pane IS an agent). Type
+# the spoken instruction straight into its ❯ input box, and submit if the user
+# said so. A trailing submit cue ("and send/submit", "go", "run it", "send it")
+# is stripped and turned into Enter.
+if [ "$kind" = claude ]; then
+    submit=""
+    rest="$(printf '%s' "$instruction" | sed -E 's/[[:space:],.]*(and[[:space:]]+)?(send( it)?|submit( it)?|go|run it)[[:space:].!]*$//I')"
+    [ "$rest" != "$instruction" ] && submit=1
+    rest="$(printf '%s' "$rest" | sed -e 's/[[:space:]]*$//')"
+    [ -n "$rest" ] || { echo "hey-claude: empty instruction for claude box" >&2; exit 1; }
+    zellij action write-chars --pane-id "$pane_id" "$rest" >/dev/null 2>&1
+    [ -n "$submit" ] && zellij action write --pane-id "$pane_id" 13 >/dev/null 2>&1
+    exit 0
+fi
+
 if [ "$kind" != shell ]; then
     notify "Hey Claude: not a shell pane" "Focused pane is '$kind' — no input line to rewrite."
     echo "hey-claude: focused pane is '$kind', not a shell" >&2
     exit 1
 fi
-pane_id="$("$FIELD" id)"
 # read may legitimately be empty (blank prompt); that's fine — instruction may
 # create content from nothing (e.g. "Hey Claude, write a curl to example.com").
 field="$("$FIELD" read 2>/dev/null || true)"

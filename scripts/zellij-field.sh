@@ -59,8 +59,9 @@ focused_kind() {
         | awk -F'  +' -v id="$id" '$4==id {print $7; exit}')"
     case "$cmd" in
         */zsh|*/bash|*/sh|*/fish|*/dash|*/ash) echo shell ;;
-        "" ) echo unknown ;;
-        * ) echo tui ;;
+        *claude*)                              echo claude ;;
+        "" )                                   echo unknown ;;
+        * )                                    echo tui ;;
     esac
 }
 
