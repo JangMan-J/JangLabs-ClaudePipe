@@ -7,9 +7,9 @@ spawns **one long-lived `claude` process** in streaming-JSON mode and relays
 messages to it over a Unix-domain socket. You pay the cold start **once**, at
 `up`; every `send` afterwards costs only Claude's inference latency.
 
-Measured on this machine (Haiku, warm): **~1.1 s/turn**, vs ~2.5 s for
-`claude -p` cold-start — a 2.3× speedup, with full **context retained** across
-turns (it's one continuous conversation).
+Measured on this machine (Haiku, warm, **lean default**): **~0.9 s/turn**, vs
+~2.5 s for `claude -p` cold-start, with full **context retained** across turns
+(it's one continuous conversation).
 
 No terminal multiplexer in the hot path: we own the process, so we talk to its
 stdin/stdout directly. This is deliberately a thin, reusable **platform** — the
@@ -88,6 +88,14 @@ directly from any language by connecting to the socket.
   interleave.
 - **Turn completion** is detected by Claude's own `result` event — no
   transcript-tailing, no prompt-ready heuristics, no screen scraping.
+- **Lean by default.** The persistent `claude` is launched with no tools, no
+  MCP servers, no settings/hooks, and a replaced (minimal) system prompt. This
+  drops per-turn cache tokens from ~8.7k created / ~17.7k read to **0** and stops
+  the `SessionStart` hook from firing every turn — pure overhead for a pipe that
+  only relays text. Turn detection is unaffected because it keys off Claude's
+  `result` event, not any hook. Pass `--full` to restore Claude's normal agent
+  loadout for consumers that need Claude to *act* (run tools, use MCP), not just
+  transform text.
 - **Persistence.** The `session_id` is saved to a state file; restart with
   `--resume <session_id>` to continue the same conversation.
 - **Timeout recovery.** If a turn exceeds `timeout_ms`, its `result` is still

@@ -65,6 +65,12 @@ enum Cmd {
         /// Resume a prior conversation by session id (restart recovery).
         #[arg(long)]
         resume: Option<String>,
+        /// Use Claude's full agent loadout (tools, MCP, settings/hooks) instead
+        /// of the lean default. Needed only for consumers that want Claude to
+        /// act, not just transform text. The lean default has much lower
+        /// per-turn overhead (no tools/MCP/hooks, replaced system prompt).
+        #[arg(long)]
+        full: bool,
         /// Fork to the background and return once the socket is ready.
         #[arg(long)]
         detach: bool,
@@ -103,8 +109,9 @@ async fn main() -> Result<()> {
             model,
             system,
             resume,
+            full,
             detach,
-        } => daemon::run_up(session, model, system, resume, detach).await,
+        } => daemon::run_up(session, model, system, resume, full, detach).await,
         Cmd::Send {
             text,
             session,

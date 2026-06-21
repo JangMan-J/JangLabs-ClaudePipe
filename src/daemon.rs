@@ -34,13 +34,14 @@ pub async fn run_up(
     model: Option<String>,
     system: Option<String>,
     resume: Option<String>,
+    full: bool,
     detach: bool,
 ) -> Result<()> {
     if detach {
         // Re-exec ourselves without --detach, fully detached from this shell,
         // and return once the socket appears. Keeps `up --detach` ergonomic
         // for hooks/launchers without us owning a daemonize dependency.
-        return spawn_detached(&session, &model, &system, &resume).await;
+        return spawn_detached(&session, &model, &system, &resume, full).await;
     }
 
     ensure_runtime_dir().await?;
@@ -58,7 +59,7 @@ pub async fn run_up(
     }
 
     // Spawn the persistent claude child.
-    let mut child = spawn_claude(&model, &system, &resume)
+    let mut child = spawn_claude(&model, &system, &resume, &full)
         .context("spawning persistent claude process")?;
     let stdin = child.stdin.take().expect("claude stdin piped");
     let stdout = child.stdout.take().expect("claude stdout piped");
@@ -139,12 +140,24 @@ async fn run_accept_loop(
     }
 }
 
+/// Default system prompt used in lean mode when the consumer gives none. Kept
+/// tiny on purpose — it replaces Claude's full coding-agent prompt, which is the
+/// single biggest per-turn cache reduction.
+const DEFAULT_LEAN_SYSTEM: &str =
+    "You are a fast assistant invoked over a pipe. Answer directly and concisely. \
+     Output only the answer — no preamble, no markdown fences, no commentary.";
+
 /// Spawn `claude` in persistent streaming-JSON mode. The flag combo is exactly
 /// what claude 2.1.x requires for a long-lived multi-turn process.
+///
+/// `full = false` (the default) strips per-turn overhead: no tools, no MCP, no
+/// settings/hooks, replaced system prompt — see the body. `full = true` gives
+/// Claude's normal agent loadout for consumers that need it.
 fn spawn_claude(
     model: &Option<String>,
     system: &Option<String>,
     resume: &Option<String>,
+    full: &bool,
 ) -> Result<Child> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p")
@@ -156,9 +169,45 @@ fn spawn_claude(
     if let Some(m) = model {
         cmd.arg("--model").arg(m);
     }
-    if let Some(s) = system {
-        cmd.arg("--append-system-prompt").arg(s);
+
+    if *full {
+        // Full mode: the consumer wants Claude's normal agent loadout (tools,
+        // MCP, settings/hooks). Used for "voice-driven agent" style consumers.
+        // System prompt is APPENDED to Claude's default so the agent prompt
+        // stays intact.
+        if let Some(s) = system {
+            cmd.arg("--append-system-prompt").arg(s);
+        }
+    } else {
+        // LEAN MODE (default): strip every per-turn overhead source so each turn
+        // carries no tool/MCP/hook/cache baggage. Measured effect: cache
+        // creation/read tokens drop from ~8.7k/~17.7k to 0, the SessionStart
+        // hook stops firing, and no MCP server loads. Right for a router/cleanup
+        // consumer (the common case) that only transforms text and never acts.
+        //   --system-prompt          : REPLACE the default coding-agent prompt
+        //                              (the single biggest cache reduction).
+        //   --tools ""               : no built-in tools (a router never acts).
+        //   --strict-mcp-config      : load no MCP servers (no --mcp-config given).
+        //   --setting-sources ""     : load no user/project/local settings, so
+        //                              SessionStart hooks + project memory don't
+        //                              attach to every turn.
+        //   --exclude-dynamic-...    : move cwd/env/git out of the cached prompt
+        //                              for better cache reuse.
+        // NOTE: we do NOT pass --no-session-persistence; it would break --resume
+        // (our restart-recovery story), and session save is cheap.
+        let prompt = system.clone().unwrap_or_else(|| DEFAULT_LEAN_SYSTEM.to_string());
+        cmd.arg("--system-prompt")
+            .arg(prompt)
+            .arg("--tools")
+            .arg("")
+            .arg("--strict-mcp-config")
+            .arg("--setting-sources")
+            .arg("")
+            .arg("--exclude-dynamic-system-prompt-sections")
+            .arg("--permission-mode")
+            .arg("default");
     }
+
     if let Some(r) = resume {
         cmd.arg("--resume").arg(r);
     }
@@ -460,6 +509,7 @@ async fn spawn_detached(
     model: &Option<String>,
     system: &Option<String>,
     resume: &Option<String>,
+    full: bool,
 ) -> Result<()> {
     ensure_runtime_dir().await?;
     let exe = std::env::current_exe().context("locating own exe")?;
@@ -473,6 +523,9 @@ async fn spawn_detached(
     }
     if let Some(r) = resume {
         cmd.arg("--resume").arg(r);
+    }
+    if full {
+        cmd.arg("--full");
     }
     // Detach from this process group / shell.
     cmd.stdin(Stdio::null())
