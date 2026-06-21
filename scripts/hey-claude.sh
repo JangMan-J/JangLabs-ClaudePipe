@@ -37,11 +37,11 @@ else echo "hey-claude: claude-pipe not found" >&2; exit 3; fi
 notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "hey-claude" "$1" "${2:-}" || true; }
 
 # key chords (Linux input-event codes for `ydotool key`)
-K_SELALL='29:1 30:1 30:0 29:0'   # Ctrl+A
-K_COPY='29:1 46:1 46:0 29:0'     # Ctrl+C
-K_DELETE='111:1 111:0'           # Delete
+K_KILLLINE='29:1 22:1 22:0 29:0' # Ctrl+U — kill whole input line (readline + TUI boxes)
 K_END='107:1 107:0'              # End
 K_ENTER='28:1 28:0'              # Enter
+K_SELALL='29:1 30:1 30:0 29:0'   # Ctrl+A — select-all (GUI fields only)
+K_COPY='29:1 46:1 46:0 29:0'     # Ctrl+C — copy (GUI fields only)
 
 # shellcheck disable=SC2086
 chord() { ydotool key $1; }
@@ -51,11 +51,47 @@ if [ $# -ge 1 ]; then instruction="$*"; else instruction="$(cat)"; fi
 instruction="$(printf '%s' "$instruction" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 [ -n "$instruction" ] || { echo "hey-claude: empty instruction" >&2; exit 1; }
 
-# --- read the current field via clipboard -------------------------------------
-# select-all + copy, then read the selection. Small settle delays so the chord and
-# the clipboard write land before we read.
-chord "$K_SELALL"; chord "$K_COPY"
-current="$(wl-paste --no-newline 2>/dev/null || true)"
+# --- read the current field (HYBRID: zellij dump-screen, else clipboard) -------
+# In a zellij pane (the Claude box or a shell) we read non-destructively with
+# dump-screen — crucially this avoids Ctrl+A/Ctrl+C, which in a TUI mean
+# go-to-start / interrupt, NOT select-all / copy (that was corrupting the field
+# and could interrupt Claude). Only for non-zellij GUI fields do we fall back to
+# the clipboard route.
+pane_id=""
+if [ -n "${ZELLIJ:-}" ] && command -v zellij >/dev/null 2>&1; then
+    pane_id="$(zellij action list-panes --all --json 2>/dev/null | python3 -c '
+import sys, json
+try: panes = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for p in panes:
+    if p.get("is_focused") and not p.get("is_plugin"):
+        print("terminal_%s" % p["id"]); break
+' 2>/dev/null)"
+fi
+
+if [ -n "$pane_id" ]; then
+    # Extract the ❯ input line from the rendered viewport. For the Claude box it
+    # is the "❯ ..." line that sits between two horizontal-rule lines near the
+    # bottom; for a shell it is the last "❯ "/"$ " prompt line. We take the LAST
+    # line that begins (after the prompt marker) the input, strip the marker.
+    current="$(zellij action dump-screen --pane-id "$pane_id" 2>/dev/null | python3 -c '
+import sys
+lines = [l.rstrip("\n") for l in sys.stdin]
+# find the last line whose first non-space char is a prompt marker
+cand = ""
+for l in lines:
+    s = l.lstrip()
+    for m in ("❯ ", "❯", "$ ", "# ", "% "):
+        if s.startswith(m):
+            cand = s[len(m):]
+            break
+sys.stdout.write(cand.strip())
+' 2>/dev/null)"
+else
+    # GUI field: select-all + copy, read the selection.
+    chord "$K_SELALL"; chord "$K_COPY"
+    current="$(wl-paste --no-newline 2>/dev/null || true)"
+fi
 
 # --- ask the agent ------------------------------------------------------------
 resp="$(printf 'CURRENT_PROMPT:\n%s\n\nINSTRUCTION:\n%s' "$current" "$instruction" \
@@ -92,18 +128,28 @@ op="$(printf '%s' "$plan" | python3 -c 'import sys,json;print(json.load(sys.stdi
 get_text() { printf '%s' "$plan" | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin).get("text",""))'; }
 
 # --- apply --------------------------------------------------------------------
-case "$op" in
-    none)
-        exit 0 ;;
-    submit)
-        chord "$K_ENTER" ;;
-    clear)
-        chord "$K_SELALL"; chord "$K_DELETE" ;;
-    replace)
-        chord "$K_SELALL"; chord "$K_DELETE"
-        ydotool type -- "$(get_text)" ;;
-    append)
-        chord "$K_END"
-        ydotool type -- "$(get_text)" ;;
-esac
+# In a zellij pane, address the pane DIRECTLY with `zellij action write` — no focus
+# dependency, no race, reliable (ydotool key injection was unreliable here: keys
+# went to the wrong target / didn't land). Only GUI fields fall back to ydotool.
+# zellij byte codes: Ctrl-U=21, Enter=13, End=control-seq (we use write-chars+nav).
+if [ -n "$pane_id" ]; then
+    zkill() { zellij action write --pane-id "$pane_id" 21 >/dev/null 2>&1; }   # Ctrl-U
+    zenter() { zellij action write --pane-id "$pane_id" 13 >/dev/null 2>&1; }  # Enter
+    ztype() { zellij action write-chars --pane-id "$pane_id" "$1" >/dev/null 2>&1; }
+    case "$op" in
+        none)    : ;;
+        submit)  zenter ;;
+        clear)   zkill ;;
+        replace) zkill; ztype "$(get_text)" ;;
+        append)  ztype "$(get_text)" ;;   # write-chars inserts at cursor (line end)
+    esac
+else
+    case "$op" in
+        none)    : ;;
+        submit)  chord "$K_ENTER" ;;
+        clear)   chord "$K_KILLLINE" ;;
+        replace) chord "$K_KILLLINE"; ydotool type -- "$(get_text)" ;;
+        append)  chord "$K_END"; ydotool type -- "$(get_text)" ;;
+    esac
+fi
 exit 0
