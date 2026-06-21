@@ -67,6 +67,35 @@ pane_id="$("$FIELD" id 2>/dev/null || true)"
 # said so. A trailing submit cue ("and send/submit", "go", "run it", "send it")
 # is stripped and turned into Enter.
 if [ "$kind" = claude ]; then
+    # normalize for whole-instruction control-command matching: lowercase, strip
+    # surrounding punctuation/space.
+    norm="$(printf '%s' "$instruction" | tr 'A-Z' 'a-z' \
+        | sed -E 's/^[[:space:][:punct:]]+//; s/[[:space:][:punct:]]+$//')"
+
+    # CONTROL: clear/scratch the box. The WHOLE instruction is the command
+    # (e.g. "clear that", "scratch that", "erase this line", "delete my input").
+    case "$norm" in
+        clear|scratch|erase|delete \
+        |clear\ *that|scratch\ *that|erase\ *that|delete\ *that \
+        |clear\ *this*|scratch\ *this*|erase\ *this*|delete\ *this* \
+        |clear\ *it|scratch\ *it|erase\ *it|delete\ *it \
+        |clear\ *input|delete\ *input|erase\ *input|clear\ *line|erase\ *line|delete\ *line \
+        |start\ over|never\ mind|nevermind)
+            zellij action write --pane-id "$pane_id" 21 >/dev/null 2>&1   # Ctrl-U
+            exit 0
+            ;;
+    esac
+
+    # CONTROL: submit-only. The WHOLE instruction is the submit verb.
+    case "$norm" in
+        send|send\ it|submit|submit\ it|go|run\ it|enter)
+            zellij action write --pane-id "$pane_id" 13 >/dev/null 2>&1   # Enter
+            exit 0
+            ;;
+    esac
+
+    # Otherwise: type the instruction into the box. A TRAILING submit cue on a
+    # longer instruction ("... and send", "... send it") strips + submits.
     submit=""
     rest="$(printf '%s' "$instruction" | sed -E 's/[[:space:],.]*(and[[:space:]]+)?(send( it)?|submit( it)?|go|run it)[[:space:].!]*$//I')"
     [ "$rest" != "$instruction" ] && submit=1
