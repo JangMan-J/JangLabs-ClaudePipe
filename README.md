@@ -36,7 +36,7 @@ echo "transcribe this" | claude-pipe send          # message from stdin
 claude-pipe send --json "..."                        # full response envelope
 
 # Inspect / stop.
-claude-pipe status
+claude-pipe status   # exits 0 if the session is live, 1 otherwise (usable as a shell predicate)
 claude-pipe down
 ```
 
@@ -108,6 +108,26 @@ directly from any language by connecting to the socket.
 
 - `<session>.sock` — the request/reply socket
 - `<session>.state.json` — pid, current `session_id`, model
+
+## Scripts (`scripts/`)
+
+A reference consumer: the **"Hey Claude"** voxtype Siri-style command — a spoken
+instruction rewrites the in-progress input line of the focused zellij shell pane.
+Built on `zellij action` only (no clipboard, no ydotool, no focus change).
+
+- `zellij-field.sh` — read/replace the focused shell pane's input line:
+  `id | kind | read | replace TEXT`. Refuses non-shell (TUI) panes.
+- `hey-claude-up.sh` — idempotent keep-warm; brings up a `voxtype` session with the
+  rewrite system prompt. `CP_MODEL=claude-haiku-4-5-20251001` for fast warm turns.
+- `hey-claude.sh` — the handler: capture the line → `send --json` → parse the reply
+  → apply. Reply contract is **JSON ops, fail-closed** (an unparseable reply types
+  nothing):
+  - `{"op":"replace","text":"…","submit":false}` — fill the line (and optionally run it)
+  - `{"op":"keys","keys":["ctrl+a"]}` — a pure cursor/edit action
+  - `{"op":"none"}` — refuse / touch nothing
+
+Still to wire: wake-phrase detection in voxtype's `llm-gate.sh` and the keep-warm
+call on "Recording started".
 
 ## Status
 
