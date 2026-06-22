@@ -204,7 +204,11 @@ elif o in ("submit","clear","none"):
 else: none("bad-op")
 ')"
 op="$(printf '%s' "$plan" | python3 -c 'import sys,json;print(json.load(sys.stdin)["op"])')"
-get_text() { printf '%s' "$plan" | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin).get("text",""))'; }
+# get_text emits the op's text with a single trailing space appended, mirroring
+# voxtype's per-PTT `append_text = " "` so the next dictation lands separated from
+# this replacement/append rather than running together. Done in the handler (not
+# the agent prompt) to keep the agent contract unchanged.
+get_text() { printf '%s' "$plan" | python3 -c 'import sys,json;sys.stdout.write(json.load(sys.stdin).get("text","")+" ")'; }
 dbg "plan=[$plan] op=[$op]"
 
 # --- apply --------------------------------------------------------------------
