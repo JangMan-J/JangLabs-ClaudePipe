@@ -77,33 +77,54 @@ instruction="$(printf '%s' "$instruction" | sed -e 's/^[[:space:]]*//' -e 's/[[:
 # go-to-start / interrupt, NOT select-all / copy (that was corrupting the field
 # and could interrupt Claude). Only for non-zellij GUI fields do we fall back to
 # the clipboard route.
-# Resolve the focused zellij pane. We do NOT gate on $ZELLIJ: when invoked from
-# voxtype's gate (a daemon/systemd context) $ZELLIJ is unset even though zellij is
-# running. Instead, ask zellij directly; if it answers with a focused terminal
-# pane, use the zellij path. `--session` pins the session when not attached.
+# Resolve the focused zellij pane WITHOUT gating on $ZELLIJ (unset in the gate's
+# daemon context). See the block below for the attached-client resolution.
 pane_id=""
+zsession=""
 if command -v zellij >/dev/null 2>&1; then
-    # Pick the LIVE session: $ZELLIJ_SESSION_NAME if set, else the first session
-    # that is not marked EXITED (list-sessions tags dead ones "EXITED"). Strip
-    # ANSI color codes from the listing before matching.
-    zsession="${ZELLIJ_SESSION_NAME:-}"
-    if [ -z "$zsession" ]; then
-        zsession="$(zellij list-sessions 2>/dev/null \
-            | sed 's/\x1b\[[0-9;]*m//g' \
-            | grep -v 'EXITED' \
-            | awk 'NF{print $1; exit}')"
+    # Resolve the target session+pane via the ATTACHED CLIENT, not by guessing.
+    # We CANNOT rely on $ZELLIJ / $ZELLIJ_SESSION_NAME or the "(current)" marker from
+    # `list-sessions`: when invoked from voxtype's gate (a daemon context attached to
+    # NO terminal), $ZELLIJ is unset AND `list-sessions` prints NO "(current)" marker,
+    # so any "first non-EXITED"/"(current)" heuristic silently lands on an idle
+    # session whose focused pane is an empty shell → read=[] → agent "none" → the
+    # "command does nothing" symptom.
+    #
+    # `zellij --session S action list-clients` reports each ATTACHED client's session,
+    # focused ZELLIJ_PANE_ID, and running command — server-side truth, no $ZELLIJ
+    # needed. Output (header + one row per attached client):
+    #     CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND
+    #     1         terminal_0     /opt/claude-code/bin/claude
+    # An idle session prints the header with no rows. So: scan live sessions, and pick
+    # the attached client whose RUNNING_COMMAND is claude (the real dictation target);
+    # fall back to the first attached client of any session. This also yields the exact
+    # focused pane id directly, sidestepping plugin/terminal id-collision in list-panes.
+    zlist="$(zellij list-sessions --no-formatting 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
+        | grep -v 'EXITED' | awk 'NF{print $1}')"
+    fb_session=""; fb_pane=""
+    for s in $zlist; do
+        [ -n "$s" ] || continue
+        # first claude-running client row in this session, else first client row
+        line="$(zellij --session "$s" action list-clients 2>/dev/null | awk '
+            NR==1 { next }                       # skip header
+            NF>=2 {
+                if ($3 ~ /claude/ && claude=="") { claude=$2 }
+                if (first=="") { first=$2 }
+            }
+            END { if (claude!="") print "claude " claude; else if (first!="") print "term " first }
+        ')"
+        kind="${line%% *}"; pid="${line#* }"
+        if [ "$kind" = "claude" ] && [ -n "$pid" ]; then
+            zsession="$s"; pane_id="$pid"; break          # exact target — done
+        elif [ "$kind" = "term" ] && [ -z "$fb_session" ] && [ -n "$pid" ]; then
+            fb_session="$s"; fb_pane="$pid"               # remember, keep scanning
+        fi
+    done
+    if [ -z "$pane_id" ] && [ -n "$fb_session" ]; then
+        zsession="$fb_session"; pane_id="$fb_pane"
     fi
     zargs=""
     [ -n "$zsession" ] && zargs="--session $zsession"
-    # shellcheck disable=SC2086
-    pane_id="$(zellij $zargs action list-panes --all --json 2>/dev/null | python3 -c '
-import sys, json
-try: panes = json.load(sys.stdin)
-except Exception: sys.exit(0)
-for p in panes:
-    if p.get("is_focused") and not p.get("is_plugin"):
-        print("terminal_%s" % p["id"]); break
-' 2>/dev/null)"
 fi
 
 if [ -n "$pane_id" ]; then
