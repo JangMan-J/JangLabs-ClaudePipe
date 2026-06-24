@@ -61,8 +61,13 @@ claude-pipe kill gemini-1
 **Recipes** (the only place agent-specific knowledge lives — no DSL, just
 built-ins): `gemini` (`gemini --acp`), `codex`, and `claude-channels` — the
 verified **subscription-safe** way to prompt Claude as an agent with no `-p` and
-no Agent SDK (it drives a live `claude --channels` via a `claude/channel` MCP
-bridge; see [`docs/acp-transport-spec.md`](docs/acp-transport-spec.md) §7.2).
+no Agent SDK. The `claude-channels` recipe is powered by
+[**`channels-kit`**](channels-kit/) — a standalone framework that drives a live
+`claude --channels` session and exposes it as an ACP-subset agent (streamed
+chunks + **permission relay**), with an honest per-method parity map
+([`channels-kit/PARITY.md`](channels-kit/PARITY.md)). See
+[`docs/acp-transport-spec.md`](docs/acp-transport-spec.md) §7.2 and
+[`docs/channels-kit-plan.md`](docs/channels-kit-plan.md).
 
 **Verification.** [`tests/verify.sh`](tests/verify.sh) is the spec §12 done-gate
 — 12 checks (byte fidelity, per-session ordering + fairness + overflow, handoff
