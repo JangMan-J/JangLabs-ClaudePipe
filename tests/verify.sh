@@ -202,6 +202,28 @@ else
 fi
 stop_supervisor
 
+# ── Check 5b: handoff safety MID-TURN — steal waits for stopReason (§9) ───────
+echo "[Check 5b] handoff mid-turn — steal blocks until the open turn's stopReason"
+SOCK="$(start_one_mock)"
+SID="$(node "$CLIENT" "$SOCK" newsession)"
+# Start a SLOW:2500 turn (stays open 2.5s) on client-1 in the background.
+( node "$CLIENT" "$SOCK" prompt "$SID" "SLOW:2500" >/dev/null 2>&1 ) &
+sleep 0.4   # ensure the prompt is in flight → a turn is open
+T0=$(date +%s%N)
+SOCK2="$("$BIN" attach mock 2>/dev/null)"   # steal attempt during the open turn
+R2="$(node "$CLIENT" "$SOCK2" prompt "$SID" "after-steal" 2>&1)"
+T1=$(date +%s%N)
+MS=$(( (T1 - T0) / 1000000 ))
+# Pass = the steal+prompt took ≥1800ms (it waited for the ~2500ms turn boundary)
+# AND client-2's post-steal turn completed (end_turn). An unsafe immediate steal
+# would finish in well under 1s.
+if [ "$MS" -ge 1800 ] && echo "$R2" | grep -q "end_turn"; then
+  ok "check5b-handoff-midturn (steal waited ${MS}ms for stopReason, then leased; §9 safe)"
+else
+  bad "check5b-handoff-midturn" "took ${MS}ms (want >=1800); client-2: $R2"
+fi
+stop_supervisor
+
 # ── Check 9: voxtype/v1 untouched — v1 up/send/down/status still function ─────
 echo "[Check 9] v1 untouched — up/status/down still work (no claude needed: status path)"
 # We don't spawn a real claude (that needs auth); we assert the v1 CLI surface is
