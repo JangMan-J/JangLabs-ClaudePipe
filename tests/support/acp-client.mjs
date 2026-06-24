@@ -12,6 +12,13 @@
 //                                   chunk bytes length + sha for byte-fidelity
 //   callback <sessionId>         -> drive a CALLBACK prompt, answering the
 //                                   server-initiated fs/read_text_file request
+//   stall <sessionId> <text>     -> send a prompt then NEVER read the chunks back
+//                                   (socket read paused), holding the connection
+//                                   open. Forces the relay's forward queue to grow
+//                                   → exercises soft/hard overflow. Runs until
+//                                   killed. (§12.3 fairness/overflow.)
+//   probe-newsession             -> like newsession but also print elapsed ms from
+//                                   connect to the sessionId ack (warm-start, §12.4)
 //   raw                          -> read stdin lines, write them to the socket,
 //                                   print every received line (manual scripting)
 
@@ -134,6 +141,62 @@ async function main() {
       const id = sendReq('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'CALLBACK' }] })
       const r = await waitResult(id)
       console.log(JSON.stringify({ stopReason: r.result?.stopReason, chunks }))
+      break
+    }
+    case 'stall': {
+      // Send a prompt, then deliberately stop reading the socket so the relay's
+      // per-session forward queue grows (soft → hard bound). We pause the socket
+      // so the kernel receive buffer fills and backpressure reaches the relay.
+      const [sessionId, ...textParts] = rest
+      const text = textParts.join(' ')
+      sendReq('session/prompt', { sessionId, prompt: [{ type: 'text', text }] })
+      // Pause reading: no 'data' draining → the OS recv buffer fills → relay's
+      // forward write blocks → its per-session queue grows and pressures.
+      sock.pause()
+      console.error(`[stall] prompt sent on ${sessionId}; reader paused, holding open`)
+      // Hold the process open until externally killed.
+      await new Promise(() => {})
+      break
+    }
+    case 'probe-newsession': {
+      const t0 = process.hrtime.bigint()
+      const id = sendReq('session/new', { cwd: '/tmp', mcpServers: [] })
+      const r = await waitResult(id)
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6
+      console.log(JSON.stringify({ sessionId: r.result?.sessionId ?? '', ms }))
+      break
+    }
+    case 'multi': {
+      // ONE connection (single lease, §9), N sessions multiplexed (§4). Each
+      // "spec" is "<promptText>" run on its own fresh session, all fired
+      // concurrently. Proves per-session fairness: a FLOOD on one session must not
+      // stall a normal prompt on another over the same connection. Prints a JSON
+      // map { sessionId: {stopReason, chunkCount} } once all turns complete.
+      const specs = rest // each arg is a prompt text
+      // Mint a session per spec.
+      const sessions = []
+      for (let k = 0; k < specs.length; k++) {
+        const id = sendReq('session/new', { cwd: '/tmp', mcpServers: [] })
+        const r = await waitResult(id)
+        sessions.push(r.result.sessionId)
+      }
+      const counts = {}
+      for (const s of sessions) counts[s] = 0
+      onLineHandlers.push((m) => {
+        if (m.method === 'session/update' && m.params?.sessionId in counts) {
+          if (m.params.update?.content?.text != null) counts[m.params.sessionId]++
+        }
+      })
+      // Fire all prompts concurrently on the one connection.
+      const results = await Promise.all(
+        sessions.map((s, k) => {
+          const id = sendReq('session/prompt', { sessionId: s, prompt: [{ type: 'text', text: specs[k] }] })
+          return waitResult(id).then((r) => [s, r.result?.stopReason])
+        })
+      )
+      const out = {}
+      for (const [s, stop] of results) out[s] = { stopReason: stop, chunks: counts[s] }
+      console.log(JSON.stringify(out))
       break
     }
     default:

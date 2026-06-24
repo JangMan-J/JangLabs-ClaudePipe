@@ -84,18 +84,26 @@ impl Recipe {
             // the blast-radius container for the research-preview churn. It runs
             // the channels bridge (which itself launches `claude --channels`), so
             // the agent rides the subscription. Carries the §7.2 caveats.
-            "claude-channels" | "claude" => Some(Recipe {
-                name: "claude-channels".into(),
-                kind: RecipeKind::ClaudeChannels,
-                // The bridge binary is our own (built in Phase 4) — it owns the
-                // `claude --dangerously-load-development-channels` lifecycle and
-                // presents the channel protocol on stdio for the relay.
-                command: "claude-channels-bridge".into(),
-                args: vec![],
-                // Subscription OAuth requires ANTHROPIC_API_KEY be UNSET (§7.2 PoC).
-                env: HashMap::from([("ANTHROPIC_API_KEY".to_string(), None)]),
-                pool_size: 0,
-            }),
+            "claude-channels" | "claude" => {
+                // Our own bridge (Node, mirroring the proven probe's MCP-SDK
+                // usage): it owns the `claude --dangerously-load-development-
+                // channels` lifecycle and presents a minimal ACP subset on stdio
+                // for the relay. Resolved from `CLAUDE_PIPE_CHANNELS_BRIDGE` or a
+                // default repo path. The bridge contains ALL channels research-
+                // preview churn (§7.2 blast-radius container) and never touches
+                // the acp-stdio data-path code (separate binary → no contamination).
+                let bridge = std::env::var("CLAUDE_PIPE_CHANNELS_BRIDGE")
+                    .unwrap_or_else(|_| "scripts/claude-channels-bridge.mjs".to_string());
+                Some(Recipe {
+                    name: "claude-channels".into(),
+                    kind: RecipeKind::ClaudeChannels,
+                    command: "node".into(),
+                    args: vec![bridge],
+                    // Subscription OAuth requires ANTHROPIC_API_KEY be UNSET (§7.2).
+                    env: HashMap::from([("ANTHROPIC_API_KEY".to_string(), None)]),
+                    pool_size: 0,
+                })
+            }
             // Test-only: a deterministic mock stdio ACP agent for the §12
             // verification suite. Resolved from `CLAUDE_PIPE_MOCK_AGENT` (the path
             // to `tests/support/mock-acp-agent.mjs`); absent that env var the

@@ -36,9 +36,18 @@ pub struct FrameInfo {
     pub id: Option<RpcId>,
     /// `Some(true)` iff this is a `session/prompt` *request* (opens a turn).
     pub is_prompt_request: bool,
+    /// True iff this frame carries a `method` field, i.e. it is a request or a
+    /// notification (not a response). Combined with [`Self::id`] this lets the
+    /// relay tell an agent→client *request* (method + id → a server-initiated
+    /// callback whose id awaits a client response) from a *response* (id, no
+    /// method) without interpreting WHICH method it is (Invariant 2). Used only
+    /// for steal-safety callback tracking (§9), never to act on payload.
+    pub has_method: bool,
     /// `Some(stopReason)` iff this is a *response* carrying `result.stopReason`
-    /// (closes a turn). The string is the stopReason value, relayed-as-is; we
-    /// only need its presence, but we surface it for telemetry/logging.
+    /// (closes a turn). The value is read for **telemetry only** and is NEVER
+    /// branched on — turn-close needs only its *presence*. Carrying the value is
+    /// not a semantics act (Invariant 2): the relay never changes behavior based
+    /// on whether it is `end_turn` vs `refusal` etc.
     pub stop_reason: Option<String>,
 }
 
@@ -94,10 +103,17 @@ pub fn inspect(frame: &[u8]) -> FrameInfo {
         info.session_id = Some(sid.to_string());
     }
 
+    // --- has_method: request/notification vs response (no method) -------
+    // Lets the relay distinguish an agent→client request (method + id = a
+    // server-initiated callback) from a response (id, no method) without reading
+    // WHICH method it is. Used for callback steal-safety tracking only (§9).
+    let method = obj.get("method").and_then(|m| m.as_str());
+    info.has_method = method.is_some();
+
     // --- turn-open: a session/prompt REQUEST ----------------------------
     // The one and only method name we recognize. This is the minimum peek the
     // spec permits (§9) — purely to gate steal safety, never to act on payload.
-    if obj.get("method").and_then(|m| m.as_str()) == Some("session/prompt") {
+    if method == Some("session/prompt") {
         info.is_prompt_request = true;
     }
 

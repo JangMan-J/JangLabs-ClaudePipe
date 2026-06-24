@@ -1,0 +1,10 @@
+{
+  "name": "claude-pipe-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Node helpers for claude-pipe v2: the claude-channels recipe bridge (§7.2). The bridge's channel-server mode is an MCP/stdio server Claude spawns, mirroring the proven channel-probe.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}

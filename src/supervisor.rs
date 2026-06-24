@@ -417,15 +417,23 @@ async fn do_control_attach(sup: &Arc<Supervisor>, target: &str, holder: &str) ->
     };
     // Pre-register the intended lease holder in the relay so the lease the data
     // socket grants on connect is tagged with the orchestrator's real holder
-    // (visible to `list`, matchable by `detach`). The lease is truly *taken* when
-    // the orchestrator connects its ACP client to the returned path.
-    let _ = agent
+    // (visible to `list`, matchable by `detach`). We AWAIT the relay's ack before
+    // returning the path, so the holder is registered before the orchestrator can
+    // connect — closing the ordering race (audit F3). The lease is truly *taken*
+    // when the orchestrator connects its ACP client to the returned path.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if agent
         .relay
         .cmd_tx
         .send(RelayCmd::SetIntendedHolder {
             holder: holder.to_string(),
+            reply: ack_tx,
         })
-        .await;
+        .await
+        .is_ok()
+    {
+        let _ = ack_rx.await; // wait for the relay to record the holder
+    }
     let socket = agent_socket_path(&id);
     let mut info = agent.info.clone();
     info.lease_holder = Some(holder.to_string());
