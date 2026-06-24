@@ -1,5 +1,87 @@
 # claude-pipe
 
+claude-pipe is **two things in one binary**:
+
+- **v2 — an ACP transport** (the current direction): a `sessionId`-aware,
+  semantics-blind, byte-faithful **Agent Client Protocol** conduit + a warm pool
+  of ACP-speaking agents, for a **model-as-client orchestrator**. This is the
+  pivot off `claude -p` — see [`docs/acp-transport-spec.md`](docs/acp-transport-spec.md)
+  (frozen spec) and the **[v2 quickstart](#v2--acp-transport-for-an-orchestrator)** below.
+- **v1 — a request/reply pipe to a persistent Claude** (retained, unchanged): the
+  original thin pipe the voxtype dictation tool still rides. Documented under
+  **[v1](#v1--persistent-claude-requestreply-pipe-retained)**.
+
+The two coexist: v1's `up`/`send`/`down`/`status` are untouched; v2 adds
+`serve`/`list`/`attach`/`spawn`/`detach`/`kill`/`events`.
+
+---
+
+## v2 — ACP transport for an orchestrator
+
+**Why.** Anthropic's June 2026 billing change targets the *headless drive
+surface* (`claude -p`, the Agent SDK, Actions), not OAuth auth. So claude-pipe
+stops *being* an agent and becomes a **transport**: it bills nothing; it carries
+the [Agent Client Protocol](https://agentclientprotocol.com) between an
+orchestrator (a programmatic stand-in for the human who'd otherwise sit in front
+of N IDE chats) and a fleet of warm, named ACP agents. Whatever does or doesn't
+ride a subscription is the *far-end agent's* concern, chosen per **recipe**.
+
+**What it is.** A supervisor owns a **warm pool** of ACP agents, each exposed
+**byte-faithfully on its own Unix socket** (pure ACP — a stock client can't tell
+it's pooled). It parses exactly two things — `sessionId` (routing/fairness) and
+the `session/prompt`⇄`stopReason` turn bracket (steal safety) — and is otherwise
+byte-transparent. A stateless CLI and a read-only telemetry stream drive it
+**out-of-band** (never on the data socket).
+
+```sh
+cargo build --release
+
+# 1. Start the supervisor with a warm pool (here: one Gemini ACP agent).
+claude-pipe serve --prespawn gemini --detach
+
+# 2. See the pool.
+claude-pipe list
+#   ID         RECIPE   PID     LIVENESS   LEASE   SESSIONS
+#   gemini-1   gemini   12345   Warm       -       0
+
+# 3. Lease an agent — this PRINTS its pure-ACP data-socket path.
+sock=$(claude-pipe attach gemini)
+
+# 4. Point ANY stock ACP client at $sock and speak raw ACP (initialize,
+#    session/new, session/prompt → stopReason). claude-pipe adds no envelope.
+
+# 5. Watch per-session telemetry (queue depth / age / lifecycle), read-only.
+claude-pipe events --agent gemini-1
+
+# 6. Hand off / release / stop.
+claude-pipe detach            # release your lease (turn-boundary steal on re-attach)
+claude-pipe kill gemini-1
+```
+
+**Recipes** (the only place agent-specific knowledge lives — no DSL, just
+built-ins): `gemini` (`gemini --acp`), `codex`, and `claude-channels` — the
+verified **subscription-safe** way to prompt Claude as an agent with no `-p` and
+no Agent SDK (it drives a live `claude --channels` via a `claude/channel` MCP
+bridge; see [`docs/acp-transport-spec.md`](docs/acp-transport-spec.md) §7.2).
+
+**Verification.** [`tests/verify.sh`](tests/verify.sh) is the spec §12 done-gate
+— 12 checks (byte fidelity, per-session ordering + fairness + overflow, handoff
+safety, callback pass-through, stock-client invisibility, strictly-in-band,
+warm-start, real `gemini --acp`, live `claude --channels` on the subscription,
+and v1-untouched). Run `bash tests/verify.sh` (hermetic) or add
+`RUN_GEMINI=1 RUN_CLAUDE=1` for the two external-agent checks.
+
+> **Design contract.** The normative spec is `docs/acp-transport-spec.md`
+> (frozen) and its gated plan `docs/acp-transport-impl-plan.md`. The transport is
+> deliberately *lean*: it owns process lifecycle, framing fidelity, addressing,
+> and telemetry — and nothing else. Answering callbacks, scheduling, and
+> out-of-band substance handling are explicitly the orchestrator's job, one layer
+> up.
+
+---
+
+## v1 — persistent-Claude request/reply pipe (retained)
+
 A lean, standalone **request/reply pipe to a persistent Claude Code agent**.
 
 Spawning `claude -p` per call pays a ~2.4 s cold start every time. `claude-pipe`
@@ -143,6 +225,13 @@ run as a user service so the flag is always latched.
 
 ## Status
 
-First slice: core pipe (`up` / `send` / `down` / `status`), one model session,
-text in / text out. Not yet: multi-message batching, an "attach to watch" pane,
-structured-output (`--json`-schema) replies. The wire contract is stable.
+- **v2 (ACP transport):** built and verified — the full §12 suite passes 12/12
+  (including real `gemini --acp` and a live `claude --channels` round-trip on the
+  subscription). Implemented on branch `feat/acp-transport-impl`. See
+  `docs/acp-transport-spec.md` / `docs/acp-transport-impl-plan.md`.
+- **v1 (persistent pipe):** stable and unchanged; the voxtype dictation tool
+  rides it. It is **retained**, not deprecated — it will be removed only when its
+  consumers are migrated to v2 (the spec's §12.9 keeps v1 intact until then).
+
+The v1 wire contract is stable; the v2 data path is raw ACP (no claude-pipe
+envelope, ever).
