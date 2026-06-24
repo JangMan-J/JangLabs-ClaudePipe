@@ -35,11 +35,22 @@ bad()  { RESULTS+=("FAIL  $1 -- $2"); FAIL=$((FAIL+1)); }
 info() { echo "  ... $1"; }
 
 cleanup() {
-  for p in $(pgrep -f "release/claude-pipe serve" 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
-  sleep 0.2
-  for p in $(pgrep -f "release/claude-pipe serve" 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
-  pkill -f "mock-acp-agent" 2>/dev/null
+  # Kill the supervisor we started (match the real binary path, not shell wrappers).
+  for p in $(ps -eo pid,args 2>/dev/null | grep 'target/release/claude-pipe serve' | grep -v 'grep' | grep -v 'zsh -c' | awk '{print $1}'); do
+    kill -TERM "$p" 2>/dev/null
+  done
+  sleep 0.3
+  for p in $(ps -eo pid,args 2>/dev/null | grep 'target/release/claude-pipe serve' | grep -v 'grep' | grep -v 'zsh -c' | awk '{print $1}'); do
+    kill -KILL "$p" 2>/dev/null
+  done
+  pkill -9 -f "mock-acp-agent" 2>/dev/null
+  # The claude-channels bridge spawns a real `claude --channels` + channel-server;
+  # reap them and their temp sockets so runs don't accumulate orphans.
+  pkill -9 -f "dangerously-load-development-channels" 2>/dev/null
+  pkill -9 -f "as-channel-server" 2>/dev/null
+  pkill -9 -f "claude-channels-bridge" 2>/dev/null
   rm -rf "$RT" 2>/dev/null
+  find /tmp -maxdepth 1 -name 'cp-channels-*' -mmin +1 -exec rm -rf {} + 2>/dev/null
   true
 }
 trap cleanup EXIT
