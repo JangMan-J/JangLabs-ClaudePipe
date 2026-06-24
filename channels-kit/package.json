@@ -1,0 +1,21 @@
+{
+  "name": "channels-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Expose a live `claude --channels` session as an ACP-subset agent. Pushes toward ACP parity on every surface the Claude Code Channels mechanism can carry (streaming chunks, permission relay, honest capabilities) and documents what it cannot. The strategic subscription-safe Claude path for claude-pipe's claude-channels recipe (spec §7.2).",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "bin": {
+    "channels-kit": "./cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "node-pty": "^1.1.0",
+    "zod": "^3.23.0"
+  }
+}
