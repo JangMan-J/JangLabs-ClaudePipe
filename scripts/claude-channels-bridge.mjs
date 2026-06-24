@@ -45,7 +45,6 @@ import net from 'node:net'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
 const MODE_CHANNEL_SERVER = process.argv.includes('--as-channel-server')
@@ -118,22 +117,77 @@ async function runBridgeMain() {
   const cfgPath = path.join(os.tmpdir(), `cp-channels-mcp-${process.pid}.json`)
   fs.writeFileSync(cfgPath, JSON.stringify(mcpConfig))
 
-  // Keep `claude` ALIVE for the bridge's lifetime (§7.2 caveat 3). We run it
-  // headless-but-interactive via its channels surface; it idles until tasks push.
-  const claude = spawn(
+  // Keep `claude` ALIVE and INTERACTIVE for the bridge's lifetime (§7.2 caveat 3).
+  // Claude Code "starts an interactive session by default" — but only when it sees
+  // a TTY; with a plain pipe it falls into --print mode and errors for lack of a
+  // prompt. So we allocate a PTY (node-pty) purely to keep Claude interactive. The
+  // PTY carries ONLY Claude's terminal UI, which we discard — the actual task/reply
+  // DATA rides the MCP stdio between Claude and the channel-server (the internal
+  // socket), never the PTY. So no terminal emulator sits in the ACP/channel data
+  // path (Invariant 3 preserved): the PTY is a liveness device, not a data carrier.
+  const { spawn: ptySpawn } = await import('node-pty')
+  // The channel must be tagged `server:<name>` (Claude rejects a bare name) — the
+  // `server:` form points at an MCP server from our --mcp-config (mirrors the
+  // proven probe's `server:probe`).
+  const claude = ptySpawn(
     'claude',
-    [
-      '--dangerously-load-development-channels',
-      'cppipe',
-      '--mcp-config',
-      cfgPath,
-    ],
-    { stdio: ['ignore', 'pipe', 'inherit'] }
+    ['--dangerously-load-development-channels', 'server:cppipe', '--mcp-config', cfgPath],
+    { name: 'xterm-256color', cols: 200, rows: 50, cwd: process.cwd(), env: process.env }
   )
-  claude.stdout.on('data', (d) => dbg(`claude: ${d.toString().trim().slice(0, 120)}`))
-  claude.on('exit', (code) => {
-    process.stderr.write(`[bridge] claude exited (code ${code}); bridge shutting down\n`)
-    process.exit(code ?? 1)
+  // Auto-answer the one-time development-channels confirmation ("1. I am using this
+  // for local development"). We watch the PTY output for the prompt and send "1\r".
+  // After that, Claude idles interactively with the channel listener registered.
+  // Match the confirmation against an ANSI-stripped, de-fragmented rolling window
+  // (the PTY splits text across escape sequences, so a single onData chunk may not
+  // contain the whole phrase).
+  // Match the confirmation against an ANSI-stripped, de-fragmented rolling window.
+  // We strip a broad set of escape forms (CSI incl. `<`/`>`/`?` private params,
+  // OSC, charset selects) because Claude's TUI fragments text heavily across them.
+  let confirmed = false
+  let bannerSeen = false
+  let ptyWindow = ''
+  const strip = (s) =>
+    s
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC … BEL/ST
+      .replace(/\x1b\[[0-9;?<>]*[A-Za-z]/g, '') // CSI (incl. private params)
+      .replace(/\x1b[()][AB0]/g, '') // charset selects
+      .replace(/\x1b./g, '') // any other 2-char escape
+  dbg(`spawned claude in PTY (pid ${claude.pid})`)
+  // Deterministic confirmation: on first use of --dangerously-load-development-
+  // channels Claude shows a "1. I am using this for local development / 2. Exit"
+  // picker. The TUI fragments text across escapes, so rather than rely solely on
+  // matching it, we also send the "1" selection on a timer once (idempotent — a
+  // stray "1\r" at an idle Claude prompt is harmless). The matcher below still
+  // fires earlier if it recognizes the prompt.
+  const confirmTimer = setTimeout(() => {
+    if (!confirmed) {
+      confirmed = true
+      claude.write('1\r')
+      dbg('auto-confirmed development-channels prompt (timer fallback)')
+    }
+  }, 4000)
+  claude.onData((data) => {
+    const clean = strip(data)
+    ptyWindow = (ptyWindow + clean).slice(-6000)
+    if (process.env.CHANNELS_BRIDGE_DEBUG) {
+      const oneLine = clean.replace(/\s+/g, ' ').trim()
+      if (oneLine) process.stderr.write(`[claude-pty] ${oneLine.slice(0, 180)}\n`)
+    }
+    if (!confirmed && /local development/i.test(ptyWindow)) {
+      confirmed = true
+      clearTimeout(confirmTimer)
+      // Send the selection a moment later so Claude's prompt is fully drawn.
+      setTimeout(() => claude.write('1\r'), 250)
+      dbg('auto-confirmed development-channels prompt (matched)')
+    }
+    if (!bannerSeen && /inject\s+directly|experimental/i.test(ptyWindow)) {
+      bannerSeen = true
+      dbg('channels banner seen — listener enabled, tasks can flow')
+    }
+  })
+  claude.onExit(({ exitCode }) => {
+    process.stderr.write(`[bridge] claude exited (code ${exitCode}); bridge shutting down\n`)
+    process.exit(exitCode ?? 1)
   })
 
   // ACP subset on our stdio toward the relay.
@@ -175,7 +229,7 @@ async function runBridgeMain() {
   })
 
   const cleanup = () => {
-    try { claude.kill('SIGTERM') } catch {}
+    try { claude.kill() } catch {} // node-pty: terminates the PTY child
     try { fs.unlinkSync(sockPath) } catch {}
     try { fs.unlinkSync(cfgPath) } catch {}
   }
@@ -195,8 +249,19 @@ async function driveTurn({ id, sessionId, text, inflight, getConn, out }) {
       params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: t } } },
     })
 
-  if (!conn) {
-    chunk('[bridge] channel server not yet connected to Claude; retry shortly')
+  // The channel-server connects only once Claude has booted, confirmed the
+  // dev-channels prompt, and spawned it. A prompt issued during boot waits
+  // (bounded) for that connection rather than refusing immediately.
+  let liveConn = conn
+  if (!liveConn) {
+    const deadline = Date.now() + 60000
+    while (!getConn() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 200))
+    }
+    liveConn = getConn()
+  }
+  if (!liveConn) {
+    chunk('[bridge] channel server did not connect to Claude within 60s')
     out({ jsonrpc: '2.0', id, result: { stopReason: 'refusal' } })
     return
   }
@@ -204,7 +269,7 @@ async function driveTurn({ id, sessionId, text, inflight, getConn, out }) {
   const replyText = await new Promise((resolve) => {
     inflight.set(String(chat_id), { onReply: (t) => { inflight.delete(String(chat_id)); resolve(t) } })
     // Tell the channel server to push this task into the live Claude session.
-    conn.write(JSON.stringify({ type: 'push', chat_id, content: text }) + '\n')
+    liveConn.write(JSON.stringify({ type: 'push', chat_id, content: text }) + '\n')
   })
 
   chunk(replyText)

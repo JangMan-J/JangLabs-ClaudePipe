@@ -296,15 +296,21 @@ fi
 # ── Check 7b: claude-channels vs live claude --channels (gated, subscription) ─
 if [ "${RUN_CLAUDE:-0}" = "1" ]; then
   echo "[Check 7b] recipe coverage — claude-channels round-trip on subscription"
+  echo "  ... (this launches a real interactive 'claude --channels' on the subscription;"
+  echo "       allow ~15s for Claude to boot + register the channel before the prompt)"
   rm -f "$RT/claude-pipe/"* 2>/dev/null
+  unset ANTHROPIC_API_KEY  # subscription OAuth, not API key (§7.2)
   "$BIN" serve --prespawn claude-channels --detach >/dev/null 2>&1
-  sleep 3
+  # The bridge spawns Claude lazily at startup; give it time to boot, auto-confirm
+  # the development-channels prompt, and connect its channel-server before we drive
+  # a prompt. (The bridge also waits internally up to 60s for that connection.)
+  sleep 14
   CSOCK="$("$BIN" attach claude-channels 2>/dev/null)"
   if [ -n "$CSOCK" ]; then
-    CSID="$(timeout 20 node "$CLIENT" "$CSOCK" newsession 2>&1)"
-    CRES="$(timeout 90 node "$CLIENT" "$CSOCK" prompt "$CSID" "What is 17 * 23? Reply with just the number." 2>&1)"
+    CSID="$(timeout 25 node "$CLIENT" "$CSOCK" newsession 2>&1)"
+    CRES="$(timeout 120 node "$CLIENT" "$CSOCK" prompt "$CSID" "What is 17 times 23? Reply with ONLY the number." 2>&1)"
     if echo "$CRES" | grep -q "391"; then
-      ok "check7b-claude-channels (task round-tripped on subscription; got 391)"
+      ok "check7b-claude-channels (task round-tripped on the subscription; got 391, no -p/SDK)"
     else
       bad "check7b-claude-channels" "reply: $CRES"
     fi
