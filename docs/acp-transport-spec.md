@@ -297,6 +297,18 @@ interactive process against real files → subscription side of the billing line
 > distinct protocol the orchestrator opts into is a recipe-level decision the
 > plan must settle; it MUST NOT contaminate the `acp-stdio` data-path purity.
 
+> **PoC DEMONSTRATED end-to-end on the subscription (2026-06-24).** A minimal
+> two-way Node channel server (`server.mjs` + `.mcp.json`, MCP SDK 1.29.0) was
+> launched via `claude --dangerously-load-development-channels server:probe`
+> (`ANTHROPIC_API_KEY` unset → subscription OAuth; Claude Code v2.1.186, floor
+> v2.1.80). A task pushed by `curl` (`localhost:8788`) arrived in the live session
+> as `<channel source="probe" chat_id="1">`, Claude worked it, called the `reply`
+> tool, and the result returned via the `/events` SSE stream — full task-in →
+> agentic-work → result-out round-trip, no `-p`, no Agent SDK. The throwaway probe
+> lives in this session's scratchpad (`…/scratchpad/channel-probe/`); the real
+> recipe is impl-plan item #13. This is the concrete evidence behind A.1's
+> "verified," and satisfies §11's `claude-channels` round-trip verification step.
+
 ---
 
 ## 8. Spawn ownership & the warm pool (S-spawn = supervisor)
@@ -452,7 +464,9 @@ v2 is a parallel mode, not a destructive rewrite of what's deployed.
   (subscription-safe but no inbound port / no third-party client API), hidden
   `--sdk-url` (undocumented, opaque billing).
 - **Claude Code Channels** (research preview) is the one verified subscription-
-  safe agent-in surface → §7.2.
+  safe agent-in surface → §7.2. **Empirically demonstrated end-to-end on the
+  subscription 2026-06-24** (working two-way Node probe; task round-tripped
+  through a live `claude --channels` via the `reply` tool — see §7.2 PoC note).
 
 **A.2 zellij is NOT in the data path — four independent angles, all agree.**
 - **CLI:** `dump-screen`/`write-chars`/`paste` are grid/display operations.
