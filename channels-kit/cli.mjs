@@ -28,11 +28,15 @@ const channelName = flag('channel', 'cppipe')
 const cwd = flag('cwd', process.cwd())
 const permMode = flag('permission', 'allow')
 const permissionPolicy = { mode: permMode }
+// `--permission-mode default` makes Claude's tool use prompt, which ENGAGES the
+// channel permission relay (otherwise the box default — often bypassPermissions —
+// runs tools silently and nothing relays). Omit to inherit the box default.
+const permissionMode = flag('permission-mode', undefined)
 
 if (cmd === 'acp') {
   // ACP on stdio — the recipe path. createChannelAgent reads stdin → facade and
   // writes ACP frames to stdout.
-  await createChannelAgent({ channelName, cwd, permissionPolicy, readStdin: true })
+  await createChannelAgent({ channelName, cwd, permissionPolicy, permissionMode, readStdin: true })
   process.stderr.write('[channels-kit] acp host up (ACP subset on stdio; research-preview)\n')
 } else if (cmd === 'serve') {
   // Standalone HTTP: drive the facade directly and translate to SSE.
@@ -58,7 +62,7 @@ if (cmd === 'acp') {
     } catch {}
   }
 
-  const agent = await createChannelAgent({ channelName, cwd, permissionPolicy, write: sink, readStdin: false })
+  const agent = await createChannelAgent({ channelName, cwd, permissionPolicy, permissionMode, write: sink, readStdin: false })
 
   // Drive a single standalone session.
   let sid = null

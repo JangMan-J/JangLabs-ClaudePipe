@@ -27,7 +27,14 @@ import { spawnClaudeChannels } from './lifecycle.mjs'
  * @param {string} [opts.cwd]                     cwd for the live claude.
  * @param {(line:string)=>void} [opts.write]      ACP frame sink (default: stdout).
  * @param {boolean} [opts.readStdin=true]         Feed process.stdin to the facade.
- * @param {object} [opts.permissionPolicy]        See createAcpFacade.
+ * @param {object} [opts.permissionPolicy]        See createAcpFacade (how to ANSWER
+ *                                                relayed approvals).
+ * @param {string} [opts.permissionMode]          `claude --permission-mode` value.
+ *                                                Pass 'default' to make tool use
+ *                                                prompt so the permission relay
+ *                                                engages; omit to inherit the box
+ *                                                default (often bypassPermissions →
+ *                                                no prompts, no relay). See lifecycle.
  * @param {string} [opts.serverEntry]             Path to channel-server-entry.mjs
  *                                                (default: sibling file).
  * @returns {Promise<{ facade, claude, sockPath, handleLine, close }>}
@@ -39,6 +46,7 @@ export async function createChannelAgent(opts = {}) {
     write = (line) => process.stdout.write(line),
     readStdin = true,
     permissionPolicy,
+    permissionMode,
     serverEntry = path.join(path.dirname(new URL(import.meta.url).pathname), 'channel-server-entry.mjs'),
   } = opts
 
@@ -63,6 +71,7 @@ export async function createChannelAgent(opts = {}) {
     serverCommand: process.execPath, // node
     serverArgs: [serverEntry],
     cwd,
+    permissionMode,
     onEvent: (e) => process.env.CHANNELS_KIT_DEBUG && process.stderr.write(`[channels-kit] claude ${e}\n`),
   })
 

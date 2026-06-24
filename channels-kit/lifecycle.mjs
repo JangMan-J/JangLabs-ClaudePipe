@@ -33,10 +33,16 @@ const stripAnsi = (s) =>
  * @param {string} opts.serverCommand      Executable for the channel server (e.g. node).
  * @param {string[]} opts.serverArgs       Args (e.g. [path-to-channel-server-entry]).
  * @param {string} [opts.cwd]              Working dir for claude (fixed for its life).
+ * @param {string} [opts.permissionMode]   `claude --permission-mode` value. Omit to
+ *        inherit the user's default (often `bypassPermissions` on a configured box,
+ *        in which case NO tool prompts → the permission relay never fires). Pass
+ *        `'default'` to make tool use prompt, which is what ENGAGES the
+ *        claude/channel/permission relay (the §7.2 "permission prompts relay"
+ *        obligation can only be exercised in a prompting mode).
  * @param {(event: string) => void} [opts.onEvent]  'confirmed' | 'banner' | 'exit'.
  * @returns {{ pid: number, kill: () => void, onExit: (cb) => void, bannerSeen: () => boolean }}
  */
-export async function spawnClaudeChannels({ channelName, serverCommand, serverArgs, cwd, onEvent = () => {} }) {
+export async function spawnClaudeChannels({ channelName, serverCommand, serverArgs, cwd, permissionMode, onEvent = () => {} }) {
   const dbg = (s) => process.env.CHANNELS_KIT_DEBUG && process.stderr.write(`[lifecycle] ${s}\n`)
 
   // Temp MCP config naming the channel server. Claude spawns it as a child.
@@ -49,11 +55,15 @@ export async function spawnClaudeChannels({ channelName, serverCommand, serverAr
   const { spawn: ptySpawn } = await import('node-pty')
   // server:<name> tag form is required under --dangerously-load-development-channels
   // (Claude rejects a bare name); it points at the MCP server above.
-  const claude = ptySpawn(
-    'claude',
-    ['--dangerously-load-development-channels', `server:${channelName}`, '--mcp-config', cfgPath],
-    { name: 'xterm-256color', cols: 200, rows: 50, cwd: cwd || process.cwd(), env: process.env }
-  )
+  const claudeArgs = ['--dangerously-load-development-channels', `server:${channelName}`, '--mcp-config', cfgPath]
+  if (permissionMode) claudeArgs.push('--permission-mode', permissionMode)
+  const claude = ptySpawn('claude', claudeArgs, {
+    name: 'xterm-256color',
+    cols: 200,
+    rows: 50,
+    cwd: cwd || process.cwd(),
+    env: process.env,
+  })
   dbg(`spawned claude pid ${claude.pid} channel=${channelName}`)
 
   let confirmed = false
