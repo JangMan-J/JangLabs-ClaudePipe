@@ -562,3 +562,13 @@ extern "C" {
     #[link_name = "setsid"]
     fn libc_setsid() -> i32;
 }
+
+/// Expose v1's `setsid` ceremony so the v2 supervisor's `serve --detach` reuses
+/// the identical detach-from-shell mechanism (spec §8). Safe to call from a
+/// `pre_exec` closure only.
+///
+/// # Safety
+/// Calls the libc `setsid(2)`; intended for use inside `Command::pre_exec`.
+pub unsafe fn libc_setsid_exposed() -> i32 {
+    libc_setsid()
+}
