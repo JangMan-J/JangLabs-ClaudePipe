@@ -11,7 +11,7 @@
     "channels-kit": "./cli.mjs"
   },
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

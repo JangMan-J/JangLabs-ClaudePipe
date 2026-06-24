@@ -84,6 +84,14 @@ export function facadeUnixServer(sockPath) {
   let resolveConn
   const waitConnected = new Promise((r) => (resolveConn = r))
   const srv = net.createServer((c) => {
+    // Single-connection model (1 Claude per agent). If a second peer dials in
+    // (a Claude restart, or an unexpected local process), DESTROY the old conn
+    // before adopting the new one rather than silently last-writer-win (audit C5).
+    if (conn && conn !== c) {
+      try {
+        conn.destroy()
+      } catch {}
+    }
     conn = c
     let buf = ''
     c.on('data', (d) => {
@@ -95,17 +103,32 @@ export function facadeUnixServer(sockPath) {
         if (!line.trim()) continue
         try {
           dispatch(emitter, JSON.parse(line))
-        } catch {}
+        } catch {
+          if (process.env.CHANNELS_KIT_DEBUG) process.stderr.write(`[transport] dropped malformed frame: ${line.slice(0, 80)}\n`)
+        }
       }
     })
     c.on('close', () => {
-      conn = null
+      // Only null out conn if THIS socket is still the current one — a stale
+      // socket's late close must not blank a newer connection (audit C5).
+      if (conn === c) conn = null
     })
     flush()
     resolveConn()
   })
   srv.listen(sockPath)
-  return { bus: makeBus(send, emitter), waitConnected, close: () => srv.close() }
+  return {
+    bus: makeBus(send, emitter),
+    waitConnected,
+    close: () => {
+      // Destroy the live accepted conn too, so the event loop can wind down for an
+      // embedded host that calls close() standalone (audit C6).
+      try {
+        conn?.destroy()
+      } catch {}
+      srv.close()
+    },
+  }
 }
 
 /**
@@ -129,7 +152,9 @@ export async function serverUnixClient(sockPath) {
       if (!line.trim()) continue
       try {
         dispatch(emitter, JSON.parse(line))
-      } catch {}
+      } catch {
+        if (process.env.CHANNELS_KIT_DEBUG) process.stderr.write(`[transport] dropped malformed frame: ${line.slice(0, 80)}\n`)
+      }
     }
   })
   const send = (m) => conn.write(JSON.stringify(m) + '\n')

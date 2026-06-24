@@ -37,8 +37,8 @@ for that churn, and behavior is pinned to the running Claude Code version.
 | `session/update` `tool_call` / `tool_call_update` | **CANNOT** | Claude's own tool invocations run *inside* the live process and never cross the channel. No primitive to derive them. |
 | `session/update` `plan` | **CANNOT** | Same — Claude's planning is intra-process, not channel-visible. |
 | `session/update` `usage_update` | **CANNOT** | Token/context accounting is intra-process; the channel surfaces none of it. |
-| `session/request_permission` | **CAN** **[§7.2]** | Via the documented `claude/channel/permission` relay (Claude Code ≥ v2.1.81): Claude Code emits `notifications/claude/channel/permission_request` `{request_id, tool_name, description, input_preview}`; channels-kit answers `notifications/claude/channel/permission` `{request_id, behavior}`. **Caveats:** relays Bash/Write/Edit tool approvals only — project-trust + MCP-consent dialogs do NOT relay (the PTY auto-answers those); the terminal dialog stays open in parallel and first-answer-wins; anyone who can push to the channel can approve tool use, so **gate senders**. |
-| `session/cancel` | **PARTIAL** (best-effort) | The channel has no cancel primitive. An in-flight prompt cannot be aborted mid-turn — it resolves whenever Claude's reply lands. The only true stop is killing the whole `claude` process, which forfeits all sessions on that agent, so it is not made per-session. Documented no-op by default. |
+| `session/request_permission` | **CAN** **[§7.2]** (delegate mode) | Two layers. **Channel layer (always):** the documented `claude/channel/permission` relay (Claude Code ≥ v2.1.81) — Claude Code emits `notifications/claude/channel/permission_request` `{request_id, tool_name, description, input_preview}`; channels-kit answers `notifications/claude/channel/permission` `{request_id, behavior}`. **ACP layer (policy `delegate` only):** the facade emits a **real ACP `session/request_permission` request** (`{sessionId, toolCall, options:[allow_once, reject_once]}`) to the ACP client and maps the client's `outcome.selected.optionId` back to the channel verdict — so a stock ACP client genuinely participates. In policy `allow`/`deny` (the recipe default for unattended use) the verdict is decided server-side and **no** ACP request is emitted. **Caveats:** relays Bash/Write/Edit tool approvals only — project-trust + MCP-consent dialogs do NOT relay (the PTY auto-answers those); the terminal dialog stays open in parallel and first-answer-wins; the relay only fires when Claude runs in a *prompting* permission mode (pass `permissionMode:'default'` — the box may default to `bypassPermissions`, in which case nothing prompts); anyone who can push to the channel can approve tool use, so **gate senders**. |
+| `session/cancel` | **PARTIAL** (best-effort) | The channel has no cancel primitive, so Claude's in-flight work **cannot actually be aborted**. But the facade honors the ACP contract on the *response*: a `session/cancel` marks the turn, and the turn then closes with the spec-mandated **`stopReason: cancelled`** (ACP v1 requires `cancelled` after a `session/cancel`), via either Claude's eventual `finish` or a shortened 5 s timer — not a misleading `end_turn`. An id-bearing `session/cancel` is acknowledged. What it can't do: stop the underlying compute (only a whole-process kill would, which forfeits all sessions on that agent). |
 | `session/load` (history replay) | **CANNOT** | The channel has no history-export/replay primitive. `loadSession:false` is advertised; a reattaching successor gets no replay (spec §9 documents this as a recipe-level limitation — full client-outliving durability is unavailable on this recipe). |
 | `session/set_mode` | **CANNOT** | The channel exposes no mode-switching primitive to the spawned Claude. The client's `modeId` is accepted but has no effect. |
 | `fs/read_text_file`, `fs/write_text_file` | **CANNOT** | ACP agent→client callbacks. The live Claude resolves file access *inside* its own process against real files; it never becomes an ACP callback on the data socket. (For a pure `acp-stdio` agent these DO pass through faithfully — the gap is specific to channels.) |
@@ -56,6 +56,17 @@ sessions"). channels-kit maps 1 ACP session ⇄ 1 `chat_id` over one live Claude
 **true concurrent sessions require one live `claude` per session**, which a
 supervisor (claude-pipe) arranges by spawning multiple channels-kit agents — not
 by multiplexing chat_ids inside one.
+
+**Routing safety.** On the outbound side, a `say`/`think`/`finish` carries the
+`chat_id` Claude *echoes* — and an LLM can mis-tag it (transposition,
+hallucination, or prompt-injection via task content). To avoid one session's
+content leaking into another's turn, the facade **fails closed**: when exactly
+one turn is open (the documented 1:1 model) it routes every tool call to that
+turn and **ignores the supplied `chat_id` entirely**; only when more than one
+turn is open does it trust the `chat_id`, and a tool call naming no open turn is
+**dropped and logged**, never misrouted. Cross-session isolation under genuine
+multiplexing therefore still depends on model obedience — which is why the
+supported model is one live Claude per session.
 
 ## Why some doors are closed (not laziness)
 

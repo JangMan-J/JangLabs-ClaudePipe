@@ -98,23 +98,20 @@ test('permission_request → deny policy', async () => {
   assert.equal(verdict.behavior, 'deny')
 })
 
-test('permission delegate policy consults the host', async () => {
-  const calls = []
-  const { facade, serverBus } = harness({
-    mode: 'delegate',
-    onRequest: async (req) => {
-      calls.push(req)
-      return req.tool_name === 'Bash' ? 'allow' : 'deny'
-    },
-  })
-  const verdicts = []
-  serverBus.onPermissionVerdict((v) => verdicts.push(v))
-  serverBus.emitPermissionRequest({ request_id: 'aaaaa', tool_name: 'Bash', description: '', input_preview: '' })
-  serverBus.emitPermissionRequest({ request_id: 'bbbbb', tool_name: 'Write', description: '', input_preview: '' })
-  await new Promise((r) => setTimeout(r, 20))
-  assert.equal(calls.length, 2)
-  assert.equal(verdicts.find((v) => v.request_id === 'aaaaa').behavior, 'allow')
-  assert.equal(verdicts.find((v) => v.request_id === 'bbbbb').behavior, 'deny')
+test('delegate mode: client allowing the ACP request yields an allow verdict', async () => {
+  // The primary delegate path is ACP-first (the separate test below covers a
+  // reject → deny); here we confirm allow round-trips and that the ACP request
+  // carries the channel's request_id as the toolCallId for correlation.
+  const { facade, frames, serverBus } = harness({ mode: 'delegate' })
+  let verdict = null
+  serverBus.onPermissionVerdict((v) => (verdict = v))
+  serverBus.emitPermissionRequest({ request_id: 'ccccc', tool_name: 'Bash', description: '', input_preview: '' })
+  await new Promise((r) => setTimeout(r, 5))
+  const acpReq = frames.find((f) => f.method === 'session/request_permission' && f.params.toolCall.toolCallId === 'ccccc')
+  assert.ok(acpReq, 'ACP request emitted with the channel request_id')
+  await facade.handleLine(line({ jsonrpc: '2.0', id: acpReq.id, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } }))
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(verdict.behavior, 'allow')
 })
 
 test('graceful stubs: load/set_mode/authenticate do not hang', async () => {
@@ -136,4 +133,83 @@ test('extractPromptText flattens text blocks, drops non-text', () => {
   assert.equal(extractPromptText({ prompt: [{ type: 'text', text: 'a' }, { type: 'image', data: '...' }, { type: 'text', text: 'b' }] }), 'ab')
   assert.equal(extractPromptText({ text: 'legacy' }), 'legacy')
   assert.equal(extractPromptText({ prompt: [] }), '')
+})
+
+// --- post-audit regressions ------------------------------------------------
+
+async function openTurn(facade, frames, serverBus, promptId) {
+  await facade.handleLine(line({ jsonrpc: '2.0', id: promptId * 10, method: 'session/new', params: {} }))
+  const sid = frames.find((f) => f.id === promptId * 10).result.sessionId
+  facade.handleLine(line({ jsonrpc: '2.0', id: promptId, method: 'session/prompt', params: { sessionId: sid, prompt: [{ type: 'text', text: 'q' }] } }))
+  await new Promise((r) => setTimeout(r, 5))
+  return sid
+}
+
+test('H2: session/cancel makes the turn close with stopReason cancelled', async () => {
+  const { facade, frames, serverBus } = harness()
+  const sid = await openTurn(facade, frames, serverBus, 7)
+  await facade.handleLine(line({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: sid } }))
+  // Claude eventually calls finish — but because cancel was requested, the close
+  // must report 'cancelled', not 'end_turn'.
+  serverBus.emitToolCall({ chat_id: sid, tool: 'finish', args: { text: 'done' } })
+  await new Promise((r) => setTimeout(r, 5))
+  const close = frames.find((f) => f.id === 7 && f.result?.stopReason)
+  assert.equal(close.result.stopReason, 'cancelled')
+})
+
+test('H2: id-bearing session/cancel is acknowledged (no orphaned id)', async () => {
+  const { facade, frames, serverBus } = harness()
+  const sid = await openTurn(facade, frames, serverBus, 8)
+  await facade.handleLine(line({ jsonrpc: '2.0', id: 999, method: 'session/cancel', params: { sessionId: sid } }))
+  assert.ok(frames.find((f) => f.id === 999 && 'result' in f), 'id-bearing cancel acked')
+})
+
+test('H3: a mis-tagged tool_call is routed to the single open turn (not dropped/misrouted)', async () => {
+  const { facade, frames, serverBus } = harness()
+  const sid = await openTurn(facade, frames, serverBus, 5)
+  // Claude tags the say with a WRONG chat_id; with one turn open it must still
+  // reach this session (fail-closed routing), and never leak elsewhere.
+  serverBus.emitToolCall({ chat_id: 'totally-wrong-id', tool: 'say', args: { text: 'answer' } })
+  await new Promise((r) => setTimeout(r, 5))
+  const chunk = frames.find((f) => f.method === 'session/update' && f.params.sessionId === sid)
+  assert.ok(chunk, 'mis-tagged say still reached the single open turn')
+  assert.equal(chunk.params.update.content.text, 'answer')
+})
+
+test('C4: unknown id-bearing method gets method-not-found, not fake success', async () => {
+  const { facade, frames } = harness()
+  await facade.handleLine(line({ jsonrpc: '2.0', id: 77, method: 'totally/unknown', params: {} }))
+  const r = frames.find((f) => f.id === 77)
+  assert.ok(r.error, 'error response, not result')
+  assert.equal(r.error.code, -32601)
+})
+
+test('B2: failAllTurns closes every open turn with cancelled', async () => {
+  const { facade, frames, serverBus } = harness()
+  const s1 = await openTurn(facade, frames, serverBus, 1)
+  const s2 = await openTurn(facade, frames, serverBus, 2)
+  facade.failAllTurns()
+  await new Promise((r) => setTimeout(r, 5))
+  const c1 = frames.find((f) => f.id === 1 && f.result?.stopReason)
+  const c2 = frames.find((f) => f.id === 2 && f.result?.stopReason)
+  assert.equal(c1.result.stopReason, 'cancelled')
+  assert.equal(c2.result.stopReason, 'cancelled')
+})
+
+test('delegate mode emits a real ACP session/request_permission and maps the outcome', async () => {
+  const { facade, frames, serverBus } = harness({ mode: 'delegate' })
+  await openTurn(facade, frames, serverBus, 3)
+  let verdict = null
+  serverBus.onPermissionVerdict((v) => (verdict = v))
+  serverBus.emitPermissionRequest({ request_id: 'reqid', tool_name: 'Bash', description: 'ls', input_preview: '{}' })
+  await new Promise((r) => setTimeout(r, 5))
+  // The facade should have emitted an ACP session/request_permission request.
+  const acpReq = frames.find((f) => f.method === 'session/request_permission')
+  assert.ok(acpReq, 'real ACP session/request_permission emitted')
+  assert.equal(acpReq.params.toolCall.toolCallId, 'reqid')
+  assert.ok(Array.isArray(acpReq.params.options))
+  // Answer it as the client would (reject) → channel verdict must be deny.
+  await facade.handleLine(line({ jsonrpc: '2.0', id: acpReq.id, result: { outcome: { outcome: 'selected', optionId: 'reject_once' } } }))
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(verdict.behavior, 'deny')
 })

@@ -23,9 +23,12 @@ tested module.
   `session/new`, `session/prompt` → **streamed** `agent_message_chunk` /
   `agent_thought_chunk` → `stopReason`, plus graceful stubs for what the channel
   can't carry.
-- **Relays tool-approval permission prompts** (Bash/Write/Edit) — Claude Code's
-  `claude/channel/permission` ⇄ ACP `session/request_permission` — with a
-  pluggable policy (allow / deny / delegate).
+- **Relays tool-approval permission prompts** (Bash/Write/Edit) over Claude Code's
+  `claude/channel/permission` channel, with a pluggable policy (allow / deny /
+  delegate). In **delegate** mode it surfaces a real ACP `session/request_permission`
+  request to the ACP client and maps the client's choice back to the channel
+  verdict; in allow/deny it decides server-side. (The relay only fires when Claude
+  runs in a *prompting* permission mode — pass `permissionMode: 'default'`.)
 - Offers Claude a **multi-tool reply surface** (`say` / `think` / `finish`) so it
   streams partial results, not one terminal blob.
 

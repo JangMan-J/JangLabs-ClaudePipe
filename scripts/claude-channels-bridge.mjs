@@ -21,13 +21,20 @@
 
 import { createChannelAgent } from '../channels-kit/index.mjs'
 
-// Permission policy for the recipe: default to delegating tool-approval prompts is
-// not wired to the relay yet (the orchestrator would need an out-of-band answer
-// path), so we auto-allow for unattended operation. SECURITY: anyone who can push
-// to this agent can thereby approve Claude's tool use — the recipe is for trusted
-// orchestrators only (PARITY.md + channels-reference permission-relay caveat).
-// Override with CHANNELS_KIT_PERMISSION=deny to refuse all relayed approvals.
-const mode = process.env.CHANNELS_KIT_PERMISSION === 'deny' ? 'deny' : 'allow'
+// Permission policy for the recipe (CHANNELS_KIT_PERMISSION):
+//   'allow'    (default) — auto-approve relayed tool-approval prompts server-side
+//                          (unattended). NOTE: only fires if Claude runs in a
+//                          prompting permission mode; the recipe inherits the box
+//                          default (often bypassPermissions → nothing prompts).
+//   'deny'     — refuse all relayed approvals.
+//   'delegate' — surface a REAL ACP session/request_permission to the orchestrator
+//                over the data socket and use its verdict (true ACP parity).
+// SECURITY: in 'allow', anyone who can push to this agent can thereby approve
+// Claude's tool use — the recipe is for trusted orchestrators only (PARITY.md +
+// channels-reference permission-relay caveat).
+const mode = ['deny', 'delegate'].includes(process.env.CHANNELS_KIT_PERMISSION)
+  ? process.env.CHANNELS_KIT_PERMISSION
+  : 'allow'
 
 await createChannelAgent({
   channelName: process.env.CHANNELS_KIT_NAME || 'cppipe',

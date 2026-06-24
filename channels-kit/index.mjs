@@ -90,9 +90,24 @@ export async function createChannelAgent(opts = {}) {
       fs.unlinkSync(sockPath)
     } catch {}
   }
-  claude.onExit(() => {
-    // If Claude dies, the agent is done.
-    process.env.CHANNELS_KIT_DEBUG && process.stderr.write('[channels-kit] claude exited; agent down\n')
+  // When the live Claude dies, the agent is finished. Bridge that into the facade
+  // and host so the agent doesn't become a zombie (audit B1) and any in-flight ACP
+  // turn gets a prompt stopReason instead of hanging for the full turn timeout
+  // (audit B2). An embedded host can pass onDown to handle this itself instead of
+  // the default process.exit.
+  claude.onExit((exitCode) => {
+    process.env.CHANNELS_KIT_DEBUG && process.stderr.write(`[channels-kit] claude exited (${exitCode}); failing open turns + tearing down\n`)
+    try {
+      facade.failAllTurns() // closes every open turn with stopReason 'cancelled'
+    } catch {}
+    if (typeof opts.onDown === 'function') {
+      try {
+        opts.onDown(exitCode)
+      } catch {}
+    } else {
+      close()
+      process.exit(exitCode == null || exitCode === 0 ? 0 : 1)
+    }
   })
 
   process.on('SIGTERM', () => {
