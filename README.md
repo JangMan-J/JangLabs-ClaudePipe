@@ -64,8 +64,12 @@ verified **subscription-safe** way to prompt Claude as an agent with no `-p` and
 no Agent SDK. The `claude-channels` recipe is powered by
 [**`channels-kit`**](channels-kit/) — a standalone framework that drives a live
 `claude --channels` session and exposes it as an ACP-subset agent (streamed
-chunks + **permission relay**), with an honest per-method parity map
-([`channels-kit/PARITY.md`](channels-kit/PARITY.md)). See
+chunks + an opt-in **permission relay**), with an honest per-method parity map
+([`channels-kit/PARITY.md`](channels-kit/PARITY.md)). The permission relay engages
+only when the channels session runs in a *prompting* permission mode and you select
+a non-trivial policy: set `CHANNELS_KIT_PERMISSION=delegate` (client-mediated, fails
+closed) or `=deny` on the recipe — the box default (`bypassPermissions`) otherwise
+runs tools without prompting, so nothing relays. See
 [`docs/acp-transport-spec.md`](docs/acp-transport-spec.md) §7.2 and
 [`docs/channels-kit-plan.md`](docs/channels-kit-plan.md).
 

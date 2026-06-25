@@ -9,7 +9,8 @@
 # Usage:
 #   tests/verify.sh                 # run all hermetic checks (1-6,8,9)
 #   RUN_GEMINI=1 tests/verify.sh    # also check 7a (acp-stdio vs gemini --acp)
-#   RUN_CLAUDE=1 tests/verify.sh    # also check 7b (claude-channels, subscription)
+#   RUN_CLAUDE=1 tests/verify.sh    # also 7b (claude-channels, subscription) AND
+#                                   # 7c (delegate permission relay round-trip)
 #
 # Exit 0 iff every executed check passes.
 
@@ -20,6 +21,7 @@ BIN="$ROOT/target/release/claude-pipe"
 MOCK="$ROOT/tests/support/mock-acp-agent.mjs"
 CLIENT="$ROOT/tests/support/acp-client.mjs"
 COORD="$ROOT/tests/support/steal-midturn.mjs"
+DELEG="$ROOT/tests/support/delegate-live.mjs"
 
 # Short runtime dir — Unix socket paths must be < ~108 bytes (SUN_LEN).
 RT="$(mktemp -d /tmp/cp-verify-XXXXXX)"
@@ -380,6 +382,35 @@ if [ "${RUN_CLAUDE:-0}" = "1" ]; then
   stop_supervisor
 else
   RESULTS+=("SKIP  check7b-claude-channels (set RUN_CLAUDE=1)")
+fi
+
+# ── Check 7c: DELEGATE permission path through the recipe (gated, subscription) ─
+# Proves the wired client-mediated permission path end to end: the recipe spawns the
+# bridge with CHANNELS_KIT_PERMISSION=delegate (→ bridge auto-sets --permission-mode
+# default), Claude prompts for tool approval, the channel relays it, the facade emits a
+# REAL ACP session/request_permission to the leased client, we answer allow_once, and
+# the verdict round-trips so the turn completes. (Fail-closed behavior is covered by
+# the hermetic facade tests; this is the live integration of the relay path.)
+if [ "${RUN_CLAUDE:-0}" = "1" ]; then
+  echo "[Check 7c] delegate permission relay — real ACP session/request_permission round-trip"
+  rm -f "$RT/claude-pipe/"* 2>/dev/null
+  unset ANTHROPIC_API_KEY
+  CHANNELS_KIT_PERMISSION=delegate "$BIN" serve --prespawn claude-channels --detach >/dev/null 2>&1
+  sleep 14
+  DSOCK="$("$BIN" attach claude-channels 2>/dev/null)"
+  if [ -n "$DSOCK" ]; then
+    DRES="$(timeout 140 node "$DELEG" "$DSOCK" allow 2>&1)"
+    if echo "$DRES" | grep -q '"sawPermissionRequest":true' && echo "$DRES" | grep -q '"answered":true'; then
+      ok "check7c-delegate (real ACP session/request_permission relayed + answered via the recipe)"
+    else
+      bad "check7c-delegate" "driver: $DRES"
+    fi
+  else
+    bad "check7c-delegate" "could not attach claude-channels agent (delegate)"
+  fi
+  stop_supervisor
+else
+  RESULTS+=("SKIP  check7c-delegate (set RUN_CLAUDE=1)")
 fi
 
 echo "==================================================================="

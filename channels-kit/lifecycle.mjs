@@ -69,17 +69,30 @@ export async function spawnClaudeChannels({ channelName, serverCommand, serverAr
   let confirmed = false
   let bannerSeen = false
   let win = ''
+  let torn = false // set on exit/kill so a racing timer is a no-op
   // Deterministic fallback: the confirmation picker always appears on first dev-flag
   // use; send "1" after a delay even if the (fragmented) matcher misses it. A stray
   // "1\r" at an idle Claude prompt is harmless.
+  //
+  // The timer MUST be cleared on every teardown path (review major: otherwise, if
+  // Claude dies within 4s of spawn — the spawn-failure/churn case — this fires after
+  // the process is gone, writes '1\r' to a dead PTY, emits a bogus 'confirmed', and
+  // (on an embedded host that doesn't process.exit) holds the libuv loop open). We
+  // both clearTimeout it in onExit/kill AND guard the body with `torn`, and .unref()
+  // it so a pending confirm can never by itself keep an embedded host alive.
   const confirmTimer = setTimeout(() => {
-    if (!confirmed) {
+    if (!confirmed && !torn) {
       confirmed = true
-      claude.write('1\r')
+      try {
+        claude.write('1\r')
+      } catch {
+        // PTY already gone — nothing to confirm.
+      }
       onEvent('confirmed')
       dbg('auto-confirmed (timer fallback)')
     }
   }, 4000)
+  if (typeof confirmTimer.unref === 'function') confirmTimer.unref()
 
   claude.onData((data) => {
     const clean = stripAnsi(data)
@@ -104,6 +117,8 @@ export async function spawnClaudeChannels({ channelName, serverCommand, serverAr
 
   const exitCbs = []
   claude.onExit(({ exitCode }) => {
+    torn = true
+    clearTimeout(confirmTimer) // review major: don't let the confirm fire post-exit
     try {
       fs.unlinkSync(cfgPath)
     } catch {}
@@ -114,6 +129,8 @@ export async function spawnClaudeChannels({ channelName, serverCommand, serverAr
   return {
     pid: claude.pid,
     kill: () => {
+      torn = true
+      clearTimeout(confirmTimer) // review major: clear on the kill() teardown path too
       try {
         claude.kill()
       } catch {}

@@ -94,13 +94,35 @@ impl Recipe {
                 // the acp-stdio data-path code (separate binary → no contamination).
                 let bridge = std::env::var("CLAUDE_PIPE_CHANNELS_BRIDGE")
                     .unwrap_or_else(|_| "scripts/claude-channels-bridge.mjs".to_string());
+                // Subscription OAuth requires ANTHROPIC_API_KEY be UNSET (§7.2).
+                let mut env: HashMap<String, Option<String>> =
+                    HashMap::from([("ANTHROPIC_API_KEY".to_string(), None)]);
+                // Permission-relay tunables — the recipe's explicit, opt-in knobs for
+                // the §7.2 "permission prompts relay". The orchestrator sets these in
+                // the supervisor's environment; the recipe forwards them to the bridge
+                // (which maps them onto channels-kit's permissionPolicy/permissionMode):
+                //   CHANNELS_KIT_PERMISSION       allow (default) | deny | delegate
+                //     'delegate' surfaces a REAL ACP session/request_permission to the
+                //     orchestrator over the data socket and FAILS CLOSED (deny) if the
+                //     orchestrator does not answer — true client-mediated approval.
+                //   CHANNELS_KIT_PERMISSION_MODE  `claude --permission-mode` value
+                //     (e.g. 'default'); the relay only fires in a prompting mode, and
+                //     the bridge already defaults this to 'default' for deny/delegate.
+                // We forward each only when the operator set it, so an unset variable
+                // leaves the bridge's own defaults intact (no behavior change for the
+                // common 'allow' case). These are deliberately env passthroughs, not a
+                // recipe-DSL field — recipes stay built-in Rust (Orphan ledger).
+                for key in ["CHANNELS_KIT_PERMISSION", "CHANNELS_KIT_PERMISSION_MODE"] {
+                    if let Ok(val) = std::env::var(key) {
+                        env.insert(key.to_string(), Some(val));
+                    }
+                }
                 Some(Recipe {
                     name: "claude-channels".into(),
                     kind: RecipeKind::ClaudeChannels,
                     command: "node".into(),
                     args: vec![bridge],
-                    // Subscription OAuth requires ANTHROPIC_API_KEY be UNSET (§7.2).
-                    env: HashMap::from([("ANTHROPIC_API_KEY".to_string(), None)]),
+                    env,
                     pool_size: 0,
                 })
             }

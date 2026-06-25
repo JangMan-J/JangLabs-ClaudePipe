@@ -65,6 +65,14 @@ const HARD_BOUND_BYTES: usize = 64 * 1024 * 1024;
 /// turn cannot block a handoff forever.
 const STEAL_WAIT: Duration = Duration::from_secs(30);
 
+/// How long an outstanding server-initiated callback id keeps BLOCKING a lease steal
+/// before the steal-wait treats it as abandoned (the client will never answer). The
+/// id is not dropped — a late response still clears it; this only relaxes the *wait*.
+/// Deliberately LONGER than the channels facade's 30s `session/request_permission`
+/// timeout (acp-facade.mjs) so a slow-but-real client answer always wins the race and
+/// still blocks the steal; only a truly never-answered callback is aged out here.
+const CALLBACK_STEAL_TTL: Duration = Duration::from_secs(45);
+
 /// A command the supervisor sends to a running relay over its control channel.
 pub enum RelayCmd {
     /// Hand a freshly-accepted client connection to this relay, taking the lease
@@ -111,11 +119,20 @@ struct RelayState {
     /// matching `stopReason` response id arrives.
     open_turns: HashMap<RpcId, String>,
     /// Ids of outstanding **agent→client** requests (server-initiated: `fs/*`,
-    /// `terminal/*`, `session/request_permission`) awaiting the client's response.
+    /// `terminal/*`, `session/request_permission`) → (sessionId, registered-at).
     /// Tracked so a steal never proceeds while a callback id is unanswered, which
     /// would orphan it on the new client (§9 "no orphanable server-initiated
     /// request"; audit F4). Removed when the client's response with that id passes.
-    open_callbacks: HashMap<RpcId, String>,
+    ///
+    /// The `Instant` bounds a pathology: a buggy or dead agent (e.g. the channels
+    /// facade abandoning a `session/request_permission` whose client never answers,
+    /// or any acp-stdio agent that drops a callback) would otherwise pin this map
+    /// non-empty forever, making `steal_unsafe()` permanently true and refusing every
+    /// future lease steal for the agent. The steal-WAIT (not `steal_unsafe()` itself)
+    /// ignores a callback older than [`CALLBACK_STEAL_TTL`]; the entry stays in the
+    /// map (a late response still cleans it normally — no orphan), it just stops
+    /// blocking handoff once the client has provably had long enough to answer.
+    open_callbacks: HashMap<RpcId, (String, Instant)>,
     /// Telemetry subscribers (the `events --agent` streams).
     telemetry: Vec<mpsc::Sender<Telemetry>>,
     /// Set when a session's hard memory bound was exceeded: the forwarder reads
@@ -177,8 +194,30 @@ impl RelayState {
     /// stealing now could orphan a JSON-RPC id (§9). This is agent-wide, not
     /// per-session: `attach` carries no session hint, so the conservative correct
     /// choice is to wait until the agent has no outstanding ids at all.
+    ///
+    /// Retained as the STRICT predicate that pins the §9 invariant (and is exercised
+    /// by `steal_unsafe_tracks_turns_and_callbacks`). The steal-WAIT uses the TTL-aware
+    /// [`steal_unsafe_excluding_expired`] instead, so a never-answered callback cannot
+    /// pin the agent forever; `steal_unsafe` stays the un-aged ground truth.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn steal_unsafe(&self) -> bool {
         !self.open_turns.is_empty() || !self.open_callbacks.is_empty()
+    }
+
+    /// Like [`steal_unsafe`], but a callback older than `ttl` no longer counts as
+    /// blocking — used only by the steal-WAIT so a never-answered callback cannot
+    /// pin the agent un-stealable forever (the wedge fixed here). Open turns always
+    /// block regardless of age (a turn closes on its own stopReason, not by aging).
+    /// The expired entry is intentionally NOT removed: if a late response ever
+    /// arrives it still clears the id normally via `client_to_agent`, so no id is
+    /// orphaned — this only stops the *handoff* from waiting on a dead callback.
+    fn steal_unsafe_excluding_expired(&self, ttl: Duration) -> bool {
+        if !self.open_turns.is_empty() {
+            return true;
+        }
+        self.open_callbacks
+            .values()
+            .any(|(_, registered_at)| registered_at.elapsed() < ttl)
     }
 
     /// Emit a telemetry sample to all subscribers (best-effort; a closed
@@ -410,7 +449,11 @@ async fn wait_turn_boundary(state: &Arc<Mutex<RelayState>>, boundary: &Arc<Notif
     loop {
         {
             let st = state.lock().await;
-            if st.agent_dead || !st.steal_unsafe() {
+            // Use the TTL-aware check: an open turn (or a still-fresh callback) blocks,
+            // but a callback the client has had >CALLBACK_STEAL_TTL to answer and never
+            // did no longer pins the agent un-stealable (the never-answered-callback
+            // wedge). A dead agent short-circuits to safe regardless.
+            if st.agent_dead || !st.steal_unsafe_excluding_expired(CALLBACK_STEAL_TTL) {
                 return true;
             }
         }
@@ -501,7 +544,7 @@ async fn agent_to_queues(
             } else if let Some(id) = &info.id {
                 st.open_turns
                     .get(id)
-                    .or_else(|| st.open_callbacks.get(id))
+                    .or_else(|| st.open_callbacks.get(id).map(|(sid, _)| sid))
                     .cloned()
                     .unwrap_or_else(|| "-".to_string())
             } else {
@@ -526,7 +569,7 @@ async fn agent_to_queues(
             if info.has_method && info.id.is_some() {
                 if let Some(id) = &info.id {
                     let sid = info.session_id.clone().unwrap_or_else(|| "-".into());
-                    st.open_callbacks.insert(id.clone(), sid);
+                    st.open_callbacks.insert(id.clone(), (sid, Instant::now()));
                 }
             }
 
@@ -824,7 +867,38 @@ mod tests {
         st.open_turns.clear();
         assert!(!st.steal_unsafe());
         // A pending callback alone also makes a steal unsafe (F4).
-        st.open_callbacks.insert(RpcId::Num(99), "s".into());
+        st.open_callbacks
+            .insert(RpcId::Num(99), ("s".into(), Instant::now()));
         assert!(st.steal_unsafe());
+    }
+
+    #[test]
+    fn steal_wait_ages_out_a_never_answered_callback() {
+        // The wedge fix: a callback older than CALLBACK_STEAL_TTL no longer blocks the
+        // steal-WAIT, while a fresh one (and any open turn) still does. The strict
+        // steal_unsafe() is unchanged — only the TTL-aware variant relaxes.
+        let mut st = RelayState::new();
+        let ttl = Duration::from_millis(50);
+
+        // A fresh callback blocks both predicates.
+        st.open_callbacks
+            .insert(RpcId::Num(1), ("s".into(), Instant::now()));
+        assert!(st.steal_unsafe());
+        assert!(st.steal_unsafe_excluding_expired(ttl));
+
+        // An aged callback: strict still blocks, but the TTL-aware wait does not.
+        let old = Instant::now() - Duration::from_millis(100);
+        st.open_callbacks.insert(RpcId::Num(1), ("s".into(), old));
+        assert!(st.steal_unsafe(), "strict predicate still counts the id (no orphan)");
+        assert!(
+            !st.steal_unsafe_excluding_expired(ttl),
+            "aged-out callback must not block the steal-wait"
+        );
+        // The id is still tracked, so a late response can still clear it normally.
+        assert!(st.open_callbacks.contains_key(&RpcId::Num(1)));
+
+        // An open turn always blocks regardless of callback age.
+        st.open_turns.insert(RpcId::Num(2), "s".into());
+        assert!(st.steal_unsafe_excluding_expired(ttl));
     }
 }

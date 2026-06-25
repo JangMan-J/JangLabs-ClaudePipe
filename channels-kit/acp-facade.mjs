@@ -15,8 +15,10 @@
 //                        id with { stopReason: end_turn }
 //   permission_request during the turn → policy (allow|deny|delegate). In delegate
 //     mode the facade emits a REAL ACP session/request_permission request to the
-//     client and maps the client's outcome back to the channel verdict (true ACP
-//     parity — not a private callback).
+//     client and maps the client's outcome (the flattened ACP v1 shape
+//     outcome.optionId, with outcome.outcome as the selected/cancelled discriminator)
+//     back to the channel verdict (true ACP parity — not a private callback). The
+//     mapping FAILS CLOSED: allow only on an explicit allow_once; deny otherwise.
 //
 // Routing safety (audit H3): tool_calls are demultiplexed by the chat_id Claude
 // echoes — but an LLM can mis-tag it. The documented model is 1 ACP session ⇄ 1
@@ -27,9 +29,10 @@
 
 import { acpUpdate, acpResult, acpError, extractPromptText, STOP_REASONS } from './protocol.mjs'
 
-export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow' }, turnTimeoutMs = 180000 }) {
+export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow' }, turnTimeoutMs = 180000, permissionTimeoutMs = 30000 }) {
   const dbg = (s) => process.env.CHANNELS_KIT_DEBUG && process.stderr.write(`[acp-facade] ${s}\n`)
   const send = (obj) => write(JSON.stringify(obj) + '\n')
+  const nowMs = () => Number(process.hrtime.bigint() / 1000000n) // monotonic ms
 
   let nextSession = 0
   let nextRpcId = 1_000_000 // for facade-originated requests (request_permission)
@@ -38,6 +41,15 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
   const turns = new Map()
   // facade-originated request id -> resolver (for session/request_permission)
   const pendingClientRequests = new Map()
+
+  // Per-session timestamp of the most recent turn close. Used to suppress a stale
+  // tool_call (esp. a duplicate `finish`) that a just-finished turn emits after its
+  // close but just as the NEXT same-session turn opens — which would otherwise bleed
+  // into or prematurely close turn N+1 (review minor: resolveTurn(turns.size===1)
+  // ignores chat_id, so it can't tell a stale call apart by id). Bounded grace; a
+  // real turn takes seconds, so this never drops legitimate in-turn traffic.
+  const recentlyClosedAt = new Map() // sessionId -> ms
+  const STALE_FINISH_GRACE_MS = 250
 
   // --- Resolve which open turn a tool_call belongs to (audit H3, fail-closed) ---
   function resolveTurn(chat_id) {
@@ -58,6 +70,17 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
       return
     }
     const sid = turn.sessionId
+    // Stale-call guard: if this session closed a turn within the grace window and the
+    // currently-open turn only just started, a `finish` here is almost certainly a
+    // duplicate from the finished turn — honoring it would close turn N+1 early.
+    // Drop it (the open turn's OWN finish, arriving later, closes it correctly). The
+    // same window suppresses a trailing `say` leaking the prior turn's content.
+    const closedAt = recentlyClosedAt.get(sid)
+    const inGrace = closedAt != null && nowMs() - closedAt < STALE_FINISH_GRACE_MS
+    if (inGrace && (tool === 'finish' || tool === 'say' || tool === 'think')) {
+      dbg(`stale ${tool} for ${sid} within ${STALE_FINISH_GRACE_MS}ms of a close — dropping (anti-bleed)`)
+      return
+    }
     const text = String(args?.text ?? '')
     if (tool === 'say') {
       send(acpUpdate(sid, 'agent_message_chunk', text))
@@ -81,58 +104,100 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
     if (permissionPolicy.mode === 'deny') return 'deny'
     if (permissionPolicy.mode === 'delegate') {
       // Prefer a REAL ACP session/request_permission to the client (true parity).
-      // The active session (if exactly one open turn) carries the request; if no
-      // turn is open we still ask on a synthetic session so the host can decide.
-      const sid = turns.size >= 1 ? [...turns.values()][0].sessionId : 'cppipe'
-      try {
-        const outcome = await requestPermissionFromClient(sid, reqp)
-        return outcome === 'deny' ? 'deny' : 'allow'
-      } catch {
-        // Fall back to the JS callback form if the client didn't answer.
-        if (typeof permissionPolicy.onRequest === 'function') {
-          try {
-            const v = await permissionPolicy.onRequest({ ...reqp })
-            return v === 'deny' ? 'deny' : 'allow'
-          } catch {
-            return 'allow'
-          }
+      // Attribute it to the one open turn's real session if there is exactly one;
+      // if NO turn is open we cannot honestly name a session the client minted, so
+      // we do NOT fabricate a synthetic sessionId on the ACP wire (a strict client
+      // would reject an unknown session) — we fall through to the JS callback / the
+      // fail-closed default instead (review minor: no invented 'cppipe' session).
+      const sid = turns.size >= 1 ? [...turns.values()][0].sessionId : null
+      if (sid) {
+        try {
+          const outcome = await requestPermissionFromClient(sid, reqp)
+          // requestPermissionFromClient already fails CLOSED on timeout/error/
+          // unknown option (returns 'deny'); 'allow' is returned ONLY on an explicit
+          // allow. Pass that verdict straight through.
+          return outcome === 'allow' ? 'allow' : 'deny'
+        } catch {
+          // The client could not be asked (e.g. write failed). Fall back below.
         }
-        return 'allow'
       }
+      // No attributable session, or the ACP ask could not be issued: defer to the
+      // host's JS callback if it supplied one, else FAIL CLOSED. Delegate's contract
+      // is "the client decides"; when the client cannot decide, deny is the only
+      // safe default on a Bash/Write/Edit approval path (review major: was 'allow').
+      if (typeof permissionPolicy.onRequest === 'function') {
+        try {
+          const v = await permissionPolicy.onRequest({ ...reqp })
+          return v === 'allow' ? 'allow' : 'deny'
+        } catch {
+          return 'deny'
+        }
+      }
+      return 'deny'
     }
     return 'allow' // default: unattended auto-approve (gate senders! — PARITY.md)
   }
 
   // Emit a real ACP session/request_permission request and await the client's
-  // outcome.selected.optionId, mapped to allow/deny. Bounded so a silent client
-  // can't wedge the channel verdict forever.
+  // RequestPermissionResponse, mapping it to a fail-CLOSED verdict ('allow' | 'deny').
+  //
+  // ACP v1 wire shape of the response outcome is flattened with a discriminator:
+  //   { outcome: { outcome: 'selected', optionId: 'allow_once' } }  (a choice)
+  //   { outcome: { outcome: 'cancelled' } }                          (dismissed)
+  // There is no nested `outcome.selected` object on the wire.
+  //
+  // FAIL CLOSED (review majors): the verdict is 'allow' ONLY on an explicit
+  // allow_once selection. EVERYTHING else — reject, cancelled, a JSON-RPC error
+  // response, an unknown/garbage optionId, or a 30s no-answer timeout — denies. A
+  // permission decision must be deny-unless-explicitly-allowed; this is a
+  // Bash/Write/Edit approval path. Bounded by a timer so a silent client cannot wedge
+  // the channel verdict forever; this Promise resolves 'deny' (never rejects), so the
+  // caller always gets a concrete fail-closed verdict.
   function requestPermissionFromClient(sessionId, reqp) {
     const id = nextRpcId++
     const allowOpt = 'allow_once'
     const rejectOpt = 'reject_once'
+    // ACP ToolCallUpdate.rawInput is typed `object`; input_preview is a string, so
+    // carry it as an object the schema accepts (review minor). Parse it when it is
+    // valid JSON so a client sees the structured input; else wrap the raw preview.
+    let rawInput
+    try {
+      const parsed = JSON.parse(reqp.input_preview ?? '')
+      rawInput = parsed && typeof parsed === 'object' ? parsed : { preview: String(reqp.input_preview ?? '') }
+    } catch {
+      rawInput = { preview: String(reqp.input_preview ?? '') }
+    }
     send({
       jsonrpc: '2.0',
       id,
       method: 'session/request_permission',
       params: {
         sessionId,
-        toolCall: { toolCallId: reqp.request_id, title: reqp.tool_name, rawInput: reqp.input_preview },
+        toolCall: { toolCallId: reqp.request_id, title: reqp.tool_name, rawInput },
         options: [
           { optionId: allowOpt, name: 'Allow', kind: 'allow_once' },
           { optionId: rejectOpt, name: 'Reject', kind: 'reject_once' },
         ],
       },
     })
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const timer = setTimeout(() => {
         pendingClientRequests.delete(id)
-        reject(new Error('client did not answer session/request_permission'))
-      }, 30000)
-      pendingClientRequests.set(id, (result) => {
+        dbg(`permission request ${id} timed out — failing closed (deny)`)
+        resolve('deny') // fail closed on no answer
+      }, permissionTimeoutMs)
+      // settle(result, error): the client's response (or, on teardown, undefined →
+      // deny). Always clears the timer and removes the pending entry exactly once.
+      const settle = (result, error) => {
         clearTimeout(timer)
-        const optionId = result?.outcome?.optionId ?? result?.outcome?.outcome
-        resolve(optionId === rejectOpt || result?.outcome?.outcome === 'cancelled' ? 'deny' : 'allow')
-      })
+        pendingClientRequests.delete(id)
+        // A JSON-RPC error response (error present, no result) → deny.
+        if (error !== undefined || result === undefined) return resolve('deny')
+        const optionId = result?.outcome?.optionId
+        // Allow ONLY on an explicit allow_once selection; all else denies.
+        resolve(optionId === allowOpt && result?.outcome?.outcome !== 'cancelled' ? 'allow' : 'deny')
+      }
+      pendingClientRequests.set(id, { settle, timer })
     })
   }
 
@@ -142,6 +207,7 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
     turn.finished = true
     if (turn.timer) clearTimeout(turn.timer)
     turns.delete(String(sessionId))
+    recentlyClosedAt.set(String(sessionId), nowMs()) // arm the anti-bleed grace window
     send(acpResult(turn.id, { stopReason }))
     dbg(`turn ${sessionId} closed: ${stopReason}`)
   }
@@ -149,6 +215,22 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
   /** Force-close every open turn (called on Claude death, audit B2). */
   function failAllTurns(stopReason = STOP_REASONS.CANCELLED) {
     for (const sid of [...turns.keys()]) closeTurn(sid, stopReason)
+  }
+
+  /**
+   * Drain all in-flight state on shutdown (review minor): settle every pending
+   * session/request_permission (fail closed → 'deny', clearing its 30s timer) and
+   * close every open turn. Without this, an embedded host that supplies onDown (so
+   * the process does NOT exit) would leave permission timers live for up to 30s,
+   * eventually firing a verdict on an already-torn-down bus. Idempotent.
+   */
+  function teardown(stopReason = STOP_REASONS.CANCELLED) {
+    for (const { settle } of [...pendingClientRequests.values()]) {
+      try {
+        settle(undefined, undefined) // undefined result → deny; clears timer + entry
+      } catch {}
+    }
+    failAllTurns(stopReason)
   }
 
   async function handleLine(line) {
@@ -164,10 +246,9 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
 
     // A RESPONSE from the client to a facade-originated request (no method, has id)?
     if (method === undefined && id !== undefined && (result !== undefined || msg.error !== undefined)) {
-      const resolver = pendingClientRequests.get(id)
-      if (resolver) {
-        pendingClientRequests.delete(id)
-        resolver(result)
+      const pending = pendingClientRequests.get(id)
+      if (pending) {
+        pending.settle(result, msg.error) // settle() clears the timer + map entry; an error response denies
       }
       return
     }
@@ -256,5 +337,5 @@ export function createAcpFacade({ bus, write, permissionPolicy = { mode: 'allow'
     dbg(`turn ${chat_id} started (pushed task)`)
   }
 
-  return { handleLine, failAllTurns }
+  return { handleLine, failAllTurns, teardown }
 }

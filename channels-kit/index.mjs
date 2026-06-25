@@ -83,7 +83,19 @@ export async function createChannelAgent(opts = {}) {
     })
   }
 
+  // Named signal handlers so close() can remove them (review minor): registering an
+  // anonymous handler per createChannelAgent call would accumulate listeners in a
+  // multi-agent embedded host and trip MaxListeners, and the first to fire would
+  // process.exit and strand sibling agents' PTYs. We register here and process.off in
+  // close(), so each agent's lifetime owns exactly one pair.
+  const onSignal = () => {
+    close()
+    process.exit(0)
+  }
+
   const close = () => {
+    process.off('SIGTERM', onSignal)
+    process.off('SIGINT', onSignal)
     claude.kill()
     transport.close()
     try {
@@ -98,7 +110,10 @@ export async function createChannelAgent(opts = {}) {
   claude.onExit((exitCode) => {
     process.env.CHANNELS_KIT_DEBUG && process.stderr.write(`[channels-kit] claude exited (${exitCode}); failing open turns + tearing down\n`)
     try {
-      facade.failAllTurns() // closes every open turn with stopReason 'cancelled'
+      // teardown closes open turns AND settles pending permission requests (fail
+      // closed), so the embedded onDown path leaves no live 30s permission timers
+      // firing a verdict on a dead bus (review minor).
+      facade.teardown()
     } catch {}
     if (typeof opts.onDown === 'function') {
       try {
@@ -110,14 +125,8 @@ export async function createChannelAgent(opts = {}) {
     }
   })
 
-  process.on('SIGTERM', () => {
-    close()
-    process.exit(0)
-  })
-  process.on('SIGINT', () => {
-    close()
-    process.exit(0)
-  })
+  process.on('SIGTERM', onSignal)
+  process.on('SIGINT', onSignal)
 
   return { facade, claude, sockPath, handleLine: facade.handleLine, close }
 }

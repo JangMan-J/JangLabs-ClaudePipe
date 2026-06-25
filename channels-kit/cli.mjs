@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // cli.mjs — channels-kit command-line entry.
 //
-//   channels-kit acp [--channel <name>] [--cwd <dir>] [--permission allow|deny]
+//   channels-kit acp [--channel <name>] [--cwd <dir>] [--permission allow|deny|delegate]
 //     Speak the ACP subset on stdio (initialize/session.new/session.prompt → …).
 //     This is what claude-pipe's claude-channels recipe spawns. Drives a live
-//     `claude --channels` underneath.
+//     `claude --channels` underneath. 'delegate' surfaces a real ACP
+//     session/request_permission to the stdio peer (fails closed if unanswered).
 //
 //   channels-kit serve [--port 8790] [--channel <name>] [--permission allow|deny]
+//     ('delegate' is rejected here — the HTTP/SSE surface has no permission responder.)
 //     Standalone HTTP surface: POST a task to / (body = task text), GET /events
 //     (SSE) to watch streamed chunks + completion. Useful without claude-pipe.
 //
@@ -15,7 +17,6 @@
 
 import http from 'node:http'
 import { createChannelAgent } from './index.mjs'
-import { createAcpFacade } from './acp-facade.mjs'
 
 const argv = process.argv.slice(2)
 const cmd = argv[0]
@@ -27,6 +28,19 @@ const flag = (name, def) => {
 const channelName = flag('channel', 'cppipe')
 const cwd = flag('cwd', process.cwd())
 const permMode = flag('permission', 'allow')
+// Validate the policy. 'delegate' surfaces a REAL ACP session/request_permission and
+// needs an ACP client to answer it — the `acp` host has one (its stdio peer), but
+// `serve` (HTTP/SSE) has NO permission responder, so a delegate request there would
+// just block 30s and (now) fail closed. Rather than silently accept a dead option,
+// reject delegate in serve mode and any unknown value outright (review minor).
+const allowedPolicies = cmd === 'serve' ? ['allow', 'deny'] : ['allow', 'deny', 'delegate']
+if (cmd === 'acp' || cmd === 'serve') {
+  if (!allowedPolicies.includes(permMode)) {
+    const why = permMode === 'delegate' ? 'serve has no ACP client to answer it' : 'unknown policy'
+    process.stderr.write(`[channels-kit] --permission ${permMode} not valid for '${cmd}' (${why}); use ${allowedPolicies.join('|')}\n`)
+    process.exit(2)
+  }
+}
 const permissionPolicy = { mode: permMode }
 // `--permission-mode default` makes Claude's tool use prompt, which ENGAGES the
 // channel permission relay (otherwise the box default — often bypassPermissions —

@@ -23,12 +23,12 @@ import { createChannelAgent } from '../channels-kit/index.mjs'
 
 // Permission policy for the recipe (CHANNELS_KIT_PERMISSION):
 //   'allow'    (default) — auto-approve relayed tool-approval prompts server-side
-//                          (unattended). NOTE: only fires if Claude runs in a
-//                          prompting permission mode; the recipe inherits the box
-//                          default (often bypassPermissions → nothing prompts).
+//                          (unattended).
 //   'deny'     — refuse all relayed approvals.
 //   'delegate' — surface a REAL ACP session/request_permission to the orchestrator
-//                over the data socket and use its verdict (true ACP parity).
+//                over the data socket and use its verdict (true ACP parity). FAILS
+//                CLOSED: if the orchestrator does not answer (or answers with an
+//                error/unknown option), the tool is DENIED (see acp-facade.mjs).
 // SECURITY: in 'allow', anyone who can push to this agent can thereby approve
 // Claude's tool use — the recipe is for trusted orchestrators only (PARITY.md +
 // channels-reference permission-relay caveat).
@@ -36,9 +36,23 @@ const mode = ['deny', 'delegate'].includes(process.env.CHANNELS_KIT_PERMISSION)
   ? process.env.CHANNELS_KIT_PERMISSION
   : 'allow'
 
+// Permission MODE for the live `claude --channels` (CHANNELS_KIT_PERMISSION_MODE):
+// the relay only ENGAGES when Claude actually prompts for tool approval, which it
+// does only in a prompting permission mode. The box default is often
+// bypassPermissions → Claude never prompts → the relay (and thus 'deny'/'delegate')
+// is a no-op. So unless an explicit mode is set, we DEFAULT to 'default' whenever the
+// operator chose a non-trivial policy ('deny' or 'delegate'), so their choice has the
+// effect they asked for. 'allow' keeps the box default (no forced prompting) — it is
+// the unattended auto-approve path and need not prompt. An explicit
+// CHANNELS_KIT_PERMISSION_MODE always wins. (Review major: previously the shim never
+// forwarded a permission mode at all, so 'delegate' was silently unreachable.)
+const explicitMode = process.env.CHANNELS_KIT_PERMISSION_MODE
+const permissionMode = explicitMode || (mode === 'allow' ? undefined : 'default')
+
 await createChannelAgent({
   channelName: process.env.CHANNELS_KIT_NAME || 'cppipe',
   permissionPolicy: { mode },
+  permissionMode,
   readStdin: true, // ACP frames in on stdin, out on stdout
 })
 
