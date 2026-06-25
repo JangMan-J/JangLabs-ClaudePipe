@@ -889,7 +889,10 @@ mod tests {
         // An aged callback: strict still blocks, but the TTL-aware wait does not.
         let old = Instant::now() - Duration::from_millis(100);
         st.open_callbacks.insert(RpcId::Num(1), ("s".into(), old));
-        assert!(st.steal_unsafe(), "strict predicate still counts the id (no orphan)");
+        assert!(
+            st.steal_unsafe(),
+            "strict predicate still counts the id (no orphan)"
+        );
         assert!(
             !st.steal_unsafe_excluding_expired(ttl),
             "aged-out callback must not block the steal-wait"
