@@ -19,6 +19,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/target/release/claude-pipe"
 MOCK="$ROOT/tests/support/mock-acp-agent.mjs"
 CLIENT="$ROOT/tests/support/acp-client.mjs"
+COORD="$ROOT/tests/support/steal-midturn.mjs"
 
 # Short runtime dir — Unix socket paths must be < ~108 bytes (SUN_LEN).
 RT="$(mktemp -d /tmp/cp-verify-XXXXXX)"
@@ -55,17 +56,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Start a fresh supervisor with a mock agent; echo the data socket path.
+# Wait (bounded) until no `claude-pipe serve` supervisor is running — deterministic
+# per-check isolation so a prior check's teardown can't leak a contending supervisor
+# into the next one (the contention the 5b flake stemmed from). Polls instead of a
+# fixed sleep so it returns as soon as the process is actually gone, and gives up after
+# ~3s so a wedged process can't hang the suite.
+wait_no_supervisor() {
+  for _ in $(seq 1 60); do
+    pgrep -f "release/claude-pipe serve" >/dev/null 2>&1 || return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# Start a fresh supervisor with a mock agent; echo the data socket path. Hardened:
+# starts from a known-clean process baseline (no leaked supervisor), and polls for the
+# attach to actually yield a socket rather than trusting a fixed boot sleep — so heavy
+# ambient load (e.g. concurrent channels testing) slows but does not break it.
 start_one_mock() {
+  wait_no_supervisor || pkill -KILL -f "release/claude-pipe serve" 2>/dev/null
   rm -f "$RT/claude-pipe/"* 2>/dev/null
   "$BIN" serve --prespawn mock --detach >/dev/null 2>&1
-  sleep 0.4
-  "$BIN" attach mock 2>/dev/null
+  # Poll for a working attach instead of a fixed `sleep 0.4`: retry until the warm
+  # mock is reachable or we exhaust the budget (~6s, generous for a loaded box).
+  local sock=""
+  for _ in $(seq 1 60); do
+    sock="$("$BIN" attach mock 2>/dev/null)"
+    [ -n "$sock" ] && break
+    sleep 0.1
+  done
+  printf '%s' "$sock"
 }
 
 stop_supervisor() {
   for p in $(pgrep -f "release/claude-pipe serve" 2>/dev/null); do kill -TERM "$p" 2>/dev/null; done
-  sleep 0.2
+  # Deterministic: wait for the supervisor to actually exit (bounded) so the next
+  # check starts clean, instead of a fixed sleep that may be too short under load.
+  wait_no_supervisor || true
 }
 
 echo "==================================================================="
@@ -214,24 +241,24 @@ fi
 stop_supervisor
 
 # ── Check 5b: handoff safety MID-TURN — steal waits for stopReason (§9) ───────
+# Deterministic, contention-immune (replaces the old `sleep 0.4` + absolute-ms floor,
+# which flaked under load — see steal-midturn.mjs). The coordinator drives BOTH clients
+# on one clock: it gates the steal on the SLOW turn being *observably open* (first chunk
+# seen — no fixed sleep), then asserts the CAUSAL §9 invariant `t_steal_done >=
+# t_slow_stop` (the steal could only finish AFTER the open turn's boundary). Uniform
+# contention shifts both timestamps together and never inverts the ordering, so a slow
+# box no longer produces a spurious fail.
 echo "[Check 5b] handoff mid-turn — steal blocks until the open turn's stopReason"
 SOCK="$(start_one_mock)"
 SID="$(node "$CLIENT" "$SOCK" newsession)"
-# Start a SLOW:2500 turn (stays open 2.5s) on client-1 in the background.
-( node "$CLIENT" "$SOCK" prompt "$SID" "SLOW:2500" >/dev/null 2>&1 ) &
-sleep 0.4   # ensure the prompt is in flight → a turn is open
-T0=$(date +%s%N)
-SOCK2="$("$BIN" attach mock 2>/dev/null)"   # steal attempt during the open turn
-R2="$(node "$CLIENT" "$SOCK2" prompt "$SID" "after-steal" 2>&1)"
-T1=$(date +%s%N)
-MS=$(( (T1 - T0) / 1000000 ))
-# Pass = the steal+prompt took ≥1800ms (it waited for the ~2500ms turn boundary)
-# AND client-2's post-steal turn completed (end_turn). An unsafe immediate steal
-# would finish in well under 1s.
-if [ "$MS" -ge 1800 ] && echo "$R2" | grep -q "end_turn"; then
-  ok "check5b-handoff-midturn (steal waited ${MS}ms for stopReason, then leased; §9 safe)"
+# The coordinator opens a SLOW:2500 turn on this lease, waits for it to be open, then
+# steals via `$BIN attach mock` and proves the steal waited for the boundary.
+R5B="$(node "$COORD" "$SOCK" "$SID" 2500 "$BIN" attach mock 2>&1)"
+if echo "$R5B" | grep -q '"ok":true'; then
+  DET="$(echo "$R5B" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{console.log(JSON.parse(d).detail)}catch{console.log("")}})' 2>/dev/null)"
+  ok "check5b-handoff-midturn ($DET)"
 else
-  bad "check5b-handoff-midturn" "took ${MS}ms (want >=1800); client-2: $R2"
+  bad "check5b-handoff-midturn" "coordinator: $R5B"
 fi
 stop_supervisor
 
