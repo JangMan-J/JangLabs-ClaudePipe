@@ -1,46 +1,42 @@
-//! claude-pipe — a lean, standalone request/reply pipe to a *persistent* Claude
-//! Code agent process.
+//! claude-pipe — v1: a lean request/reply pipe to a persistent Claude Code agent
+//! (retained for the deployed voxtype dictation tool). v2: a semantics-blind ACP
+//! **transport** for a model-as-client orchestrator (the pivot — see
+//! `docs/acp-transport-spec.md`).
 //!
-//! Why this exists: spawning `claude -p` per call pays a ~2.4s cold start every
-//! time. Instead we spawn ONE long-lived `claude` in streaming-JSON mode and
-//! relay messages to it over a Unix-domain socket. The cold start is paid once
-//! at `up`; each `send` afterwards costs only Claude's inference latency
-//! (~1s warm, measured). No terminal multiplexer in the hot path — we own the
-//! process, so we talk to its stdin/stdout directly.
+//! The two coexist during the pivot (spec §11/§12.9): v1's `up`/`send`/`down`/
+//! `status` keep working until v2 verifies. v2 adds a supervisor (`serve`) that
+//! owns a warm pool of ACP agents and a stateless control CLI
+//! (`list`/`attach`/`spawn`/`detach`/`kill`/`events`).
 //!
-//! The persistent process is driven by Claude's native streaming protocol
-//! (verified against claude 2.1.x):
+//! ── v1 persistent-Claude protocol (verified against claude 2.1.x) ──
+//! stdin: `{"type":"user","message":{"role":"user","content":"<text>"}}` per
+//! line; stdout: typed events ending each turn with a `result` event. v1 launch
+//! combo: `-p --verbose --input-format stream-json --output-format stream-json`.
 //!
-//! - stdin: one JSON object per line —
-//!   `{"type":"user","message":{"role":"user","content":"<text>"}}`
-//! - stdout: a stream of typed events; each turn ends with a
-//!   `{"type":"result","subtype":"success","result":"<text>",...}` event,
-//!   which is our turn-completion sentinel.
-//! - the same process handles many sequential turns on one `session_id`, so
-//!   context is retained across `send`s.
-//!
-//! Launch flags (required combo): `-p --verbose --input-format stream-json
-//! --output-format stream-json`. (`stream-json` output requires `--verbose`.)
-//!
-//! This is intentionally a thin, reusable PLATFORM: the only thing a consumer
-//! needs is `claude-pipe send "<text>"`, which blocks and prints the reply.
-//! voxtype's dictation hook is the first consumer, but nothing here is
-//! dictation-specific.
+//! ── v2 ACP transport ── each agent's raw ACP stdio is exposed byte-faithfully
+//! over a per-agent Unix socket; the orchestrator points a stock ACP client at
+//! the path that `attach` prints. claude-pipe parses only `sessionId` + the
+//! prompt/stopReason turn bracket and is otherwise byte-transparent.
 
+mod acp;
 mod client;
+mod control;
 mod daemon;
 mod protocol;
+mod recipe;
+mod relay;
+mod supervisor;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Default session name when `--session` is not given.
+/// Default session name when `--session` is not given (v1).
 const DEFAULT_SESSION: &str = "default";
 
 #[derive(Parser)]
 #[command(
     name = "claude-pipe",
-    about = "Request/reply pipe to a persistent Claude agent.",
+    about = "v1: request/reply pipe to a persistent Claude agent. v2: ACP transport for an orchestrator.",
     version
 )]
 struct Cli {
@@ -50,53 +46,94 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start the daemon: spawn the persistent claude process and listen on the
-    /// session socket. Runs in the foreground unless `--detach` is given.
+    // ───────────────────────── v1 (retained) ─────────────────────────
+    /// [v1] Start the persistent-claude daemon and listen on the session socket.
     Up {
-        /// Session name (one socket + one claude process per name).
         #[arg(long, default_value = DEFAULT_SESSION)]
         session: String,
-        /// Model to launch claude with (defaults to claude's own default).
         #[arg(long)]
         model: Option<String>,
-        /// System prompt appended to claude's default (keeps replies on-task).
         #[arg(long)]
         system: Option<String>,
-        /// Resume a prior conversation by session id (restart recovery).
         #[arg(long)]
         resume: Option<String>,
-        /// Use Claude's full agent loadout (tools, MCP, settings/hooks) instead
-        /// of the lean default. Needed only for consumers that want Claude to
-        /// act, not just transform text. The lean default has much lower
-        /// per-turn overhead (no tools/MCP/hooks, replaced system prompt).
         #[arg(long)]
         full: bool,
-        /// Fork to the background and return once the socket is ready.
         #[arg(long)]
         detach: bool,
     },
-    /// Send one message; block until the turn completes; print the reply.
+    /// [v1] Send one message; block until the turn completes; print the reply.
     Send {
-        /// The message text. If omitted, read the message from stdin.
         text: Option<String>,
         #[arg(long, default_value = DEFAULT_SESSION)]
         session: String,
-        /// Per-request timeout in milliseconds.
         #[arg(long, default_value_t = 60_000)]
         timeout_ms: u64,
-        /// Print the full JSON response envelope instead of just the reply text.
         #[arg(long)]
         json: bool,
     },
-    /// Stop the daemon (and its claude process) for a session.
+    /// [v1] Stop the persistent-claude daemon for a session.
     Down {
         #[arg(long, default_value = DEFAULT_SESSION)]
         session: String,
     },
-    /// Report whether a session's daemon is alive and its current session id.
+    /// [v1] Report whether a session's daemon is alive and its session id.
     Status {
         #[arg(long, default_value = DEFAULT_SESSION)]
         session: String,
+    },
+
+    // ───────────────────────── v2 (ACP transport) ─────────────────────────
+    /// [v2] Run the supervisor: own a warm pool of ACP agents + serve the control
+    /// socket. Pre-spawn agents by passing recipe names. Runs in the foreground
+    /// unless `--detach`.
+    Serve {
+        /// Recipes to pre-spawn into the warm pool (repeatable), e.g.
+        /// `--prespawn gemini --prespawn gemini`.
+        #[arg(long = "prespawn")]
+        prespawn: Vec<String>,
+        /// Fork to the background and return once the control socket is ready.
+        #[arg(long)]
+        detach: bool,
+    },
+    /// [v2] List pooled agents (id, recipe, lease holder, liveness, sessions).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// [v2] Start a new agent from a recipe.
+    Spawn {
+        /// Recipe name (e.g. `gemini`, `codex`, `claude-channels`).
+        recipe: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// [v2] Grant the lease on an agent and PRINT its data-socket path.
+    Attach {
+        /// Agent name (recipe kind) or id, e.g. `gemini` or `gemini-1` or `#1`.
+        target: String,
+        /// Opaque lease-holder tag (defaults to a per-shell tag).
+        #[arg(long)]
+        holder: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// [v2] Release the caller's lease (on `--id` if given, else any it holds).
+    Detach {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        holder: Option<String>,
+    },
+    /// [v2] Terminate a pooled agent (SIGTERM).
+    Kill {
+        /// Agent id.
+        id: String,
+    },
+    /// [v2] Stream read-only telemetry for one agent until interrupted.
+    Events {
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -104,21 +141,71 @@ enum Cmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Up {
-            session,
-            model,
-            system,
-            resume,
-            full,
-            detach,
-        } => daemon::run_up(session, model, system, resume, full, detach).await,
-        Cmd::Send {
-            text,
-            session,
-            timeout_ms,
-            json,
-        } => client::run_send(session, text, timeout_ms, json).await,
+        // v1
+        Cmd::Up { session, model, system, resume, full, detach } => {
+            daemon::run_up(session, model, system, resume, full, detach).await
+        }
+        Cmd::Send { text, session, timeout_ms, json } => {
+            client::run_send(session, text, timeout_ms, json).await
+        }
         Cmd::Down { session } => client::run_down(session).await,
         Cmd::Status { session } => client::run_status(session).await,
+        // v2
+        Cmd::Serve { prespawn, detach } => {
+            if detach {
+                supervisor_spawn_detached(prespawn).await
+            } else {
+                supervisor::run_supervisor(prespawn).await
+            }
+        }
+        Cmd::List { json } => control::run_list(json).await,
+        Cmd::Spawn { recipe, json } => control::run_spawn(recipe, json).await,
+        Cmd::Attach { target, holder, json } => control::run_attach(target, holder, json).await,
+        Cmd::Detach { id, holder } => control::run_detach(id, holder).await,
+        Cmd::Kill { id } => control::run_kill(id).await,
+        Cmd::Events { agent } => control::run_events(agent).await,
     }
+}
+
+/// Background-spawn a fresh `claude-pipe serve` (without --detach), reusing v1's
+/// setsid ceremony (spec §8: detach from the launching shell), and wait for the
+/// control socket. Used by `serve --detach`.
+async fn supervisor_spawn_detached(prespawn: Vec<String>) -> Result<()> {
+    use anyhow::{anyhow, Context};
+    use std::process::Stdio;
+    use tokio::net::UnixStream;
+    use tokio::time::{Duration, Instant};
+
+    protocol::ensure_runtime_dir().await?;
+    let exe = std::env::current_exe().context("locating own exe")?;
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.arg("serve");
+    for r in &prespawn {
+        cmd.arg("--prespawn").arg(r);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            // Reuse v1's setsid ceremony so the supervisor survives the shell.
+            if daemon::libc_setsid_exposed() == -1 {
+                // Non-fatal: still usable if already a session leader.
+            }
+            Ok(())
+        });
+    }
+    let _child = cmd.spawn().context("spawning detached supervisor")?;
+
+    let sock = protocol::control_socket_path();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if UnixStream::connect(&sock).await.is_ok() {
+            println!("claude-pipe: supervisor up (detached)");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "detached supervisor did not become ready within 15s (control socket {})",
+        sock.display()
+    ))
 }

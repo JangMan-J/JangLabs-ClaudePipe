@@ -1,0 +1,10 @@
+{
+  "name": "channel-probe",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Claude Code Channels probe (two-way) — scratch, not a repo artifact",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
