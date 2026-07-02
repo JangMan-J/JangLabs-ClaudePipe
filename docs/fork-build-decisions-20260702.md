@@ -126,9 +126,13 @@ never exhibits it. Interrupt ack itself is fast and reliable (21.5 ms, 6/6).
   content judgment (same knife as typed-failure-never-content).
 - `spawn` accepts `fence_on_interrupt`: when set, the adapter injects a fence
   turn after each interrupt (drain residue; costs ~1 s + a quota turn) so the
-  next real reply is clean by construction. Intended for unattended consumers
-  (bsoup, arbiter, workflow runners) that cannot "display a warning."
-  Consider defaulting it on in unattended lanes.
+  next real reply is clean by construction.
+- **RESOLVED (gate-plan session, same date): `fence_on_interrupt` defaults ON.**
+  The transport's consumer population is unattended agents (bsoup, arbiter,
+  workflow runners) that cannot "display a warning," so the default assumes
+  unattended; attended/UI consumers opt out per spawn. No separate lane
+  concept is introduced. The default-on fence path is the default conformance
+  case; the opt-out path carries the suspect-flag case.
 - No adapter-side relevance verification, ever (semantic judgment inside the
   transport is forbidden).
 - Conformance cases: interrupt → next turn flagged; following turn unflagged;
